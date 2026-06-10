@@ -4,30 +4,32 @@ Real-LLM validation: all 7 SPSA variants on a shared execution cache.
 Architecture
 ------------
 Phase 1 — Pre-collect (one pass, all agents):
-    For every task send it to all 5 LLM agents; store outputs, latencies,
+    For every task send it to all LLM agents; store outputs, latencies,
     and token counts in a PromptCachingLLMClient.
 
 Phase 2 — Replay (all variants, zero extra API calls):
-    Each of the 7 variants runs with the same caching client.  When the
-    orchestrator asks agent k to process task t, the client returns the
-    pre-recorded response instantly.  The first variant also warms the
-    judge cache, so subsequent variants pay zero judge API calls too.
+    Each variant runs with the same caching client.  When the orchestrator
+    asks agent k to process task t, the client returns the pre-recorded
+    response instantly.  The first variant warms the judge cache, so
+    subsequent variants pay zero judge API calls too.
 
-API call budget (per seed)
-    Pre-collect : N_tasks × N_agents              = 60 × 5 = 300 calls
-    Variant 1   : 60 agent hits + 60 judge misses =          60 calls
-    Variants 2–7: all hits                        =           0 calls
-    Total                                                    360 calls
-    (vs. 60 × 2 × 7 = 840 sequential)
+API call budget (per seed, 200 tasks, 5 agents)
+    Pre-collect : N_tasks × N_agents              = 200 × 5 = 1000 calls
+    Variant 1   : 200 agent hits + 200 judge miss =           200 calls
+    Variants 2–7: all hits                        =             0 calls
+    Total                                                     1200 calls
 
 Usage
 -----
-    # verify key / models first
+    # verify keys / models first
     python -m src.run_real_llm_comparison --dry-run
 
-    # full validation — all 7 algorithms, 3 seeds, 60 tasks
-    python -m src.run_real_llm_comparison --tasks 60 --seeds 11,42,123
-                                           --output-dir real_llm_outputs
+    # full run — Groq + OpenRouter, 200 tasks, 3 seeds
+    python -m src.run_real_llm_comparison --config llm_config_openrouter \\
+        --tasks 200 --seeds 11,42,123 --output-dir real_llm_outputs_or
+
+    # original Groq+OpenAI config
+    python -m src.run_real_llm_comparison --tasks 200 --output-dir real_llm_outputs_v5
 """
 
 from __future__ import annotations
@@ -59,6 +61,7 @@ try:
     from .run_spsa_comparison import (
         SPSA_VARIANTS, generate_tasks, BEST_PARAMS, _build_variant,
     )
+    from . import spsa_variants as _spsa_mod
 except ImportError:
     import sys as _sys
     _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -67,6 +70,7 @@ except ImportError:
     from run_spsa_comparison import (
         SPSA_VARIANTS, generate_tasks, BEST_PARAMS, _build_variant,
     )
+    import spsa_variants as _spsa_mod
 
 logger = logging.getLogger(__name__)
 
@@ -213,13 +217,16 @@ class PromptCachingLLMClient:
             result["latency"] = float(max(0.1, self._latency_rng.normal(mean, std)))
         return result
 
-    def pre_collect(self, tasks: list, model_names: List[str]) -> None:
+    def pre_collect(self, tasks: list, model_names: List[str], max_fallback_rate: float = 0.05) -> None:
         """
         Phase 1: call every (task, agent) pair once to warm the cache.
         Total API calls = len(tasks) × len(model_names).
+        Tolerates isolated 400/content-filter errors (up to max_fallback_rate);
+        aborts only if a systematic failure (rate limit exhaustion) is detected.
         """
         total = len(tasks) * len(model_names)
         done = 0
+        fallbacks = 0
         for task in tasks:
             prompt = task.text or (
                 f"{task.type.name}: complexity={task.h_Ti:.2f}, urgency={task.urgency:.2f}"
@@ -229,15 +236,25 @@ class PromptCachingLLMClient:
                 if key not in self._cache:
                     result = self.call(model_name, prompt, task.type.name)
                     if result.get("_api_fallback"):
-                        raise RuntimeError(
-                            f"Model '{model_name}' returned API fallback on call "
-                            f"{done + 1}/{total} (all retries exhausted). "
-                            "Stopping immediately to avoid burning quota on a broken endpoint. "
-                            "Check daily/rate limits for this model in llm_config.py."
+                        fallbacks += 1
+                        fallback_rate = fallbacks / max(1, done + 1)
+                        # Tolerate isolated content-filter / transient 400 errors.
+                        # Abort only if fallback rate exceeds threshold (systematic failure).
+                        if fallback_rate > max_fallback_rate:
+                            raise RuntimeError(
+                                f"Model '{model_name}' fallback rate {fallback_rate:.1%} "
+                                f"exceeds {max_fallback_rate:.0%} on call {done+1}/{total}. "
+                                "Likely rate limit or broken endpoint — aborting."
+                            )
+                        logger.warning(
+                            "Skipping fallback for model '%s' call %d/%d "
+                            "(total fallbacks: %d, rate: %.1f%%)",
+                            model_name, done + 1, total, fallbacks, fallback_rate * 100,
                         )
-                    # Approach A: overwrite latency with simulated profile value
-                    if key in self._cache:
-                        self._cache[key] = self._inject_latency(model_name, self._cache[key])
+                    else:
+                        # Approach A: overwrite latency with simulated profile value
+                        if key in self._cache:
+                            self._cache[key] = self._inject_latency(model_name, self._cache[key])
                 done += 1
                 if done % 10 == 0 or done == total:
                     logger.info(
@@ -275,13 +292,13 @@ class PromptCachingLLMClient:
 # API config + client factory
 # ---------------------------------------------------------------------------
 
-def _load_api_config() -> Tuple[dict, dict, dict, str, dict, dict]:
+def _load_api_config(config_name: str = "llm_config") -> Tuple[dict, dict, dict, str, dict, dict]:
+    import importlib
     try:
-        import importlib
-        cfg = importlib.import_module(".llm_config", package=__package__)
+        cfg = importlib.import_module(f".{config_name}", package=__package__)
     except ImportError:
-        import importlib
-        cfg = importlib.import_module("llm_config")
+        cfg = importlib.import_module(config_name)
+    logger.info("Loaded API config from module: %s", config_name)
     return (
         getattr(cfg, "LLM_ENDPOINTS", {}),
         getattr(cfg, "LLM_API_KEYS", {}),
@@ -292,8 +309,11 @@ def _load_api_config() -> Tuple[dict, dict, dict, str, dict, dict]:
     )
 
 
-def _build_clients(min_interval_s: float = 2.5) -> Tuple[PromptCachingLLMClient, str, dict]:
-    endpoints, api_keys, aliases, judge_model, latency_profiles, max_tokens = _load_api_config()
+def _build_clients(
+    min_interval_s: float = 2.5,
+    config_name: str = "llm_config",
+) -> Tuple[PromptCachingLLMClient, str, dict]:
+    endpoints, api_keys, aliases, judge_model, latency_profiles, max_tokens = _load_api_config(config_name)
     raw_base = LLMAPIClient(
         endpoints, api_keys, model_aliases=aliases,
         max_tokens_per_model=max_tokens, timeout=90,
@@ -355,7 +375,9 @@ def _run_one_variant(
     seed: int,
     num_ctrl: int,
     num_agents: int,
-) -> Tuple[dict, list]:
+    collect_trace: bool = False,
+    spsa_interval: int = 5,
+) -> Tuple[dict, list, list]:
     p = PAPER_PARAMS[variant_name]
     variant = SimulationVariant(
         name=variant_name,
@@ -366,8 +388,21 @@ def _run_one_variant(
         spsa_alpha=p["alpha"],
         spsa_beta=p["beta"],
         spsa_beta_nes_max=p["beta_nes_max"],
+        spsa_interval=spsa_interval,
     )
     np.random.seed(seed)
+
+    if collect_trace:
+        _spsa_mod.enable_trace(True)
+        _spsa_mod.clear_trace()
+    else:
+        _spsa_mod.enable_trace(False)
+
+    logger.info(
+        "    Hyperparams: alpha=%.3f  beta=%.3f  beta_nes_max=%.3f",
+        p["alpha"], p["beta"], p["beta_nes_max"],
+    )
+
     orch = ExactOrchestrator(
         num_ctrl=num_ctrl,
         num_agents=num_agents,
@@ -379,6 +414,7 @@ def _run_one_variant(
     orch.run(list(tasks))
     summary = orch.collect_summary()
     records = list(orch.task_records)
+    trace   = _spsa_mod.get_trace() if collect_trace else []
 
     for r in records:
         r["variant"] = variant_name
@@ -391,7 +427,7 @@ def _run_one_variant(
         f2_wait_loss=_f2_loss(records),
         api_fallback_rate=sum(r.get("api_fallback", 0) for r in records) / max(1, len(records)),
     )
-    return summary, records
+    return summary, records, trace
 
 
 # ---------------------------------------------------------------------------
@@ -415,64 +451,253 @@ def _aggregate(summaries: List[dict]) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Figures
+# Figures — publication quality
 # ---------------------------------------------------------------------------
 
-def _plot_bar(agg_rows: List[dict], out_path: Path) -> None:
-    metrics = [
-        ("routing_objective", "Routing objective ↑", True),
-        ("deadline_hit_rate", "Deadline hit rate ↑", True),
-        ("f2_wait_loss",      "F₂ wait loss ↓",     False),
+_FONT = {"family": "DejaVu Sans", "size": 10}
+_DPI  = 200
+
+
+def _rolling_curves(
+    records: List[dict], key: str, window: int
+) -> tuple:
+    """Return (mean_curve, std_curve) averaged over seeds."""
+    by_seed: Dict[int, list] = {}
+    for r in records:
+        val = r.get(key)
+        by_seed.setdefault(r["seed"], []).append(float(val) if val is not None else 0.0)
+    if not by_seed:
+        return np.array([]), np.array([])
+    curves = [
+        pd.Series(vals).rolling(window, min_periods=1).mean().values
+        for vals in by_seed.values()
     ]
+    max_len = max(len(c) for c in curves)
+    mat = np.full((len(curves), max_len), np.nan)
+    for i, c in enumerate(curves):
+        mat[i, : len(c)] = c
+    return np.nanmean(mat, axis=0), np.nanstd(mat, axis=0)
+
+
+def _plot_bar(agg_rows: List[dict], out_path: Path) -> None:
+    """Figure 1: grouped bar chart of summary metrics with error bars."""
+    metrics = [
+        ("routing_objective", "Routing objective ↑"),
+        ("deadline_hit_rate", "Deadline hit rate ↑"),
+        ("f2_wait_loss",      "F₂ wait loss ↓"),
+    ]
+    plt.rc("font", **_FONT)
     fig, axes = plt.subplots(1, 3, figsize=(14, 4.5))
-    for ax, (key, label, _) in zip(axes, metrics):
-        names = [LABELS.get(r["variant"], r["variant"]) for r in agg_rows]
-        means = [r.get(f"{key}_mean", 0.0) for r in agg_rows]
-        stds  = [r.get(f"{key}_std",  0.0) for r in agg_rows]
+
+    for ax, (key, label) in zip(axes, metrics):
+        names  = [LABELS.get(r["variant"], r["variant"]) for r in agg_rows]
+        means  = [r.get(f"{key}_mean", 0.0) for r in agg_rows]
+        stds   = [r.get(f"{key}_std",  0.0) for r in agg_rows]
         colors = [COLORS.get(r["variant"], "#888888") for r in agg_rows]
-        edges  = ["black" if r["variant"] == "aspsa" else color
-                  for r, color in zip(agg_rows, colors)]
-        bars = ax.bar(names, means, yerr=stds, color=colors,
-                      edgecolor=edges, linewidth=[2.5 if e == "black" else 0.8 for e in edges],
-                      capsize=4)
-        ax.set_title(label, fontsize=11)
-        ax.tick_params(axis="x", labelrotation=30, labelsize=8)
-    fig.suptitle("Real-LLM Validation (shared execution cache)", fontsize=12, fontweight="bold")
+        lws    = [2.5 if r["variant"] == "aspsa" else 0.8 for r in agg_rows]
+        edges  = ["#111111" if r["variant"] == "aspsa" else c
+                  for r, c in zip(agg_rows, colors)]
+
+        ax.bar(names, means, yerr=stds, color=colors,
+               edgecolor=edges, linewidth=lws, capsize=4,
+               error_kw={"elinewidth": 1.2, "alpha": 0.8})
+        ax.set_title(label, fontsize=10, pad=6)
+        ax.tick_params(axis="x", labelrotation=35, labelsize=8)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.grid(axis="y", linewidth=0.4, alpha=0.5)
+
+    fig.suptitle("Real-LLM Validation — Algorithm Comparison",
+                 fontsize=11, fontweight="bold", y=1.01)
     fig.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    fig.savefig(out_path, dpi=_DPI, bbox_inches="tight")
     plt.close(fig)
-    logger.info("Bar chart → %s", out_path)
+    logger.info("Figure 1 (bar chart) → %s", out_path)
 
 
-def _plot_convergence(all_records: Dict[str, List[dict]], out_path: Path, window: int = 10) -> None:
+def _plot_convergence(
+    all_records: Dict[str, List[dict]], out_path: Path, window: int = 15
+) -> None:
+    """Figure 2: routing-objective convergence curves with ±1σ shading."""
+    plt.rc("font", **_FONT)
     fig, ax = plt.subplots(figsize=(9, 4))
-    for vname, records in all_records.items():
-        by_seed: Dict[int, list] = {}
-        for r in records:
-            by_seed.setdefault(r["seed"], []).append(float(r.get("success", 0)))
-        curves = [
-            pd.Series(vals).rolling(window, min_periods=1).mean().values
-            for vals in by_seed.values()
-        ]
+
+    # draw baselines first (thin), then A-SPSA on top (thick)
+    order = sorted(all_records, key=lambda v: 0 if v == "aspsa" else 1)
+    for vname in order:
+        records = all_records[vname]
+        mean, std = _rolling_curves(records, "routing_objective", window)
+        if len(mean) == 0:
+            # fall back to success if routing_objective missing
+            mean, std = _rolling_curves(records, "success", window)
+        if len(mean) == 0:
+            continue
+        xs = np.arange(len(mean))
+        lw = 2.5 if vname == "aspsa" else 1.1
+        color = COLORS.get(vname, "#888888")
+        ax.plot(xs, mean, label=LABELS.get(vname, vname), color=color, lw=lw)
+        ax.fill_between(xs, mean - std, mean + std, color=color, alpha=0.10)
+
+    ax.set_xlabel("Task index", labelpad=4)
+    ax.set_ylabel(f"Rolling routing objective (window={window})", labelpad=4)
+    ax.set_title("Convergence of Routing Objective (Real-LLM Validation)", pad=8)
+    ax.legend(ncol=2, fontsize=8, framealpha=0.85)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.grid(linewidth=0.35, alpha=0.45)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=_DPI, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("Figure 2 (convergence) → %s", out_path)
+
+
+def _plot_multimetric(
+    all_records: Dict[str, List[dict]], out_path: Path, window: int = 15
+) -> None:
+    """Figure 3: 2×2 panel — routing obj, DHR, F2 loss, success rate."""
+    plt.rc("font", **_FONT)
+    panels = [
+        ("routing_objective", "Routing objective ↑"),
+        ("deadline_hit",      "Deadline hit rate ↑"),
+        ("f2_loss_approx",    "F₂ wait loss proxy ↓"),
+        ("success",           "Success rate ↑"),
+    ]
+    fig, axes = plt.subplots(2, 2, figsize=(13, 8), sharex=False)
+    axes_flat = axes.flatten()
+
+    order = sorted(all_records, key=lambda v: 0 if v == "aspsa" else 1)
+    for ax, (key, title) in zip(axes_flat, panels):
+        for vname in order:
+            records = all_records[vname]
+            # compute f2 proxy from true_wait / predicted_wait if needed
+            if key == "f2_loss_approx":
+                by_seed: Dict[int, list] = {}
+                for r in records:
+                    tw = r.get("true_wait")
+                    pw = r.get("predicted_wait")
+                    if tw is not None and pw is not None:
+                        val = max(0.0, float(tw) + 0.1 - float(pw)) ** 2
+                    else:
+                        val = 0.0
+                    by_seed.setdefault(r["seed"], []).append(val)
+                if not by_seed:
+                    continue
+                curves = [
+                    pd.Series(v).rolling(window, min_periods=1).mean().values
+                    for v in by_seed.values()
+                ]
+                max_len = max(len(c) for c in curves)
+                mat = np.full((len(curves), max_len), np.nan)
+                for i, c in enumerate(curves):
+                    mat[i, :len(c)] = c
+                mean, std = np.nanmean(mat, 0), np.nanstd(mat, 0)
+            else:
+                mean, std = _rolling_curves(records, key, window)
+                if len(mean) == 0:
+                    continue
+
+            xs = np.arange(len(mean))
+            lw = 2.2 if vname == "aspsa" else 1.0
+            color = COLORS.get(vname, "#888888")
+            ax.plot(xs, mean, label=LABELS.get(vname, vname), color=color, lw=lw)
+            ax.fill_between(xs, mean - std, mean + std, color=color, alpha=0.09)
+
+        ax.set_title(title, fontsize=9, pad=5)
+        ax.set_xlabel("Task index", fontsize=8)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.grid(linewidth=0.3, alpha=0.4)
+
+    # single shared legend
+    handles, lbls = axes_flat[0].get_legend_handles_labels()
+    fig.legend(handles, lbls, loc="lower center", ncol=4, fontsize=8,
+               framealpha=0.9, bbox_to_anchor=(0.5, -0.02))
+    fig.suptitle("Real-LLM Validation — Multi-Metric Convergence",
+                 fontsize=11, fontweight="bold")
+    fig.tight_layout(rect=[0, 0.05, 1, 1])
+    fig.savefig(out_path, dpi=_DPI, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("Figure 3 (multi-metric) → %s", out_path)
+
+
+def _plot_spsa_traces(root: Path, variants: List[str], seeds: List[int]) -> None:
+    """Figure 4: adaptive step α_k and curvature κ_k for A-SPSA vs fixed steps."""
+    plt.rc("font", **_FONT)
+
+    # Collect trace CSVs
+    traces: Dict[str, pd.DataFrame] = {}
+    for vname in variants:
+        frames = []
+        for seed in seeds:
+            p = root / f"spsa_trace_{vname}_seed{seed}.csv"
+            if p.exists():
+                df = pd.read_csv(p)
+                df["seed"] = seed
+                frames.append(df)
+        if frames:
+            traces[vname] = pd.concat(frames, ignore_index=True)
+
+    if not traces:
+        logger.info("No SPSA trace files found — skipping Figure 4.")
+        return
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+    # Left: α_k per variant
+    ax = axes[0]
+    for vname, df in traces.items():
+        by_seed = df.groupby("seed")["alpha_k"].apply(list)
+        curves = [pd.Series(v).rolling(5, min_periods=1).mean().values for v in by_seed]
         max_len = max(len(c) for c in curves)
         mat = np.full((len(curves), max_len), np.nan)
         for i, c in enumerate(curves):
-            mat[i, : len(c)] = c
-        mean = np.nanmean(mat, axis=0)
-        std  = np.nanstd(mat,  axis=0)
-        xs = np.arange(len(mean))
-        lw = 2.5 if vname == "aspsa" else 1.2
-        ax.plot(xs, mean, label=LABELS.get(vname, vname), color=COLORS.get(vname, "#888888"), lw=lw)
-        ax.fill_between(xs, mean - std, mean + std,
-                        color=COLORS.get(vname, "#888888"), alpha=0.10)
-    ax.set_xlabel("Task index")
-    ax.set_ylabel(f"Rolling success rate (window={window})")
-    ax.set_title("Real-LLM Validation: Convergence")
-    ax.legend(ncol=2, fontsize=8)
+            mat[i, :len(c)] = c
+        mean = np.nanmean(mat, 0)
+        lw = 2.5 if vname == "aspsa" else 1.0
+        ax.plot(mean, label=LABELS.get(vname, vname),
+                color=COLORS.get(vname, "#888888"), lw=lw)
+    ax.set_xlabel("SPSA step")
+    ax.set_ylabel("Step size α_k")
+    ax.set_title("Adaptive Step Size α_k per Algorithm")
+    ax.legend(ncol=2, fontsize=7)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.grid(linewidth=0.35, alpha=0.45)
+
+    # Right: κ_k (curvature) — A-SPSA only
+    ax = axes[1]
+    aspsa_variants = [v for v in traces if "aspsa" in v]
+    for vname in aspsa_variants:
+        df = traces[vname]
+        kappa_col = df["kappa_k"].replace(float("nan"), np.nan)
+        if kappa_col.notna().sum() == 0:
+            continue
+        by_seed = df.groupby("seed")["kappa_k"].apply(list)
+        curves = [pd.Series(v).rolling(5, min_periods=1).mean().values for v in by_seed]
+        max_len = max(len(c) for c in curves)
+        mat = np.full((len(curves), max_len), np.nan)
+        for i, c in enumerate(curves):
+            mat[i, :len(c)] = c
+        mean = np.nanmean(mat, 0)
+        lw = 2.5 if vname == "aspsa" else 1.4
+        label = LABELS.get(vname, vname)
+        ax.plot(mean, label=label, color=COLORS.get(vname, "#d62728"), lw=lw,
+                linestyle="-" if vname == "aspsa" else "--")
+    ax.set_xlabel("SPSA step")
+    ax.set_ylabel("Curvature estimate κ_k")
+    ax.set_title("A-SPSA Adaptive Curvature κ_k (Eq. 11)")
+    ax.legend(fontsize=8)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.grid(linewidth=0.35, alpha=0.45)
+
+    fig.suptitle("SPSA Parameter Trajectories over Optimisation Steps",
+                 fontsize=11, fontweight="bold")
     fig.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    out_path = root / "fig_spsa_traces.png"
+    fig.savefig(out_path, dpi=_DPI, bbox_inches="tight")
     plt.close(fig)
-    logger.info("Convergence → %s", out_path)
+    logger.info("Figure 4 (SPSA traces) → %s", out_path)
 
 
 # ---------------------------------------------------------------------------
@@ -511,16 +736,40 @@ def run_real_llm_comparison(
     num_ctrl: int,
     num_agents: int,
     cache_file: Optional[str],
+    config_name: str = "llm_config",
+    log_file: Optional[str] = None,
+    spsa_interval: int = 5,
 ) -> None:
+    root = Path(output_dir)
+    root.mkdir(parents=True, exist_ok=True)
+
+    handlers: List[logging.Handler] = [
+        logging.StreamHandler(sys.stdout),
+    ]
+    if log_file:
+        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s  %(levelname)-7s  %(message)s",
         datefmt="%H:%M:%S",
+        handlers=handlers,
+        force=True,
     )
-    root = Path(output_dir)
-    root.mkdir(parents=True, exist_ok=True)
+    if log_file:
+        logging.getLogger("src.spsa_variants").setLevel(logging.DEBUG)
+        logging.getLogger("spsa_variants").setLevel(logging.DEBUG)
 
-    caching_client, judge_model, latency_profiles = _build_clients(min_interval_s=rate_interval_s)
+    logger.info("Config module  : %s", config_name)
+    logger.info("Tasks          : %d", num_tasks)
+    logger.info("Seeds          : %s", seeds)
+    logger.info("Variants       : %s", variants)
+    logger.info("SPSA interval  : %d (effective steps per 200 tasks: ~%d)",
+                spsa_interval, max(0, (num_tasks - 15) // max(1, spsa_interval)))
+    logger.info("Output dir     : %s", root.resolve())
+
+    caching_client, judge_model, latency_profiles = _build_clients(
+        min_interval_s=rate_interval_s, config_name=config_name,
+    )
 
     # Approach A: inject simulated latency profiles after real API calls
     if latency_profiles:
@@ -541,7 +790,7 @@ def run_real_llm_comparison(
         dry_run(caching_client, judge_model)
         return
 
-    agent_model_names = [p.model_name for p in PROFILES]
+    agent_model_names = [p.model_name for p in PROFILES[:num_agents]]
     all_summaries: Dict[str, List[dict]] = {v: [] for v in variants}
     all_records:   Dict[str, List[dict]] = {v: [] for v in variants}
 
@@ -584,15 +833,17 @@ def run_real_llm_comparison(
         # ------------------------------------------------------------------
         logger.info("Phase 2 — replaying %d variants …", len(variants))
         for v_idx, variant_name in enumerate(variants):
-            hits_before  = caching_client.hits
+            hits_before   = caching_client.hits
             misses_before = caching_client.misses
 
             logger.info("  [%d/%d] %s  seed=%d", v_idx + 1, len(variants),
                         variant_name.upper(), seed)
             t0 = time.perf_counter()
-            summary, records = _run_one_variant(
+            summary, records, trace = _run_one_variant(
                 variant_name, tasks, caching_client, judge_model,
                 seed=seed, num_ctrl=num_ctrl, num_agents=num_agents,
+                collect_trace=True,
+                spsa_interval=spsa_interval,
             )
             elapsed = time.perf_counter() - t0
 
@@ -600,12 +851,12 @@ def run_real_llm_comparison(
             new_misses = caching_client.misses  - misses_before
             logger.info(
                 "  Done %.1fs  routing=%.3f  DHR=%.3f  F2=%.2f  "
-                "cache hits=%d misses=%d",
+                "cache hits=%d misses=%d  trace_steps=%d",
                 elapsed,
                 summary.get("routing_objective", 0),
                 summary.get("deadline_hit_rate", 0),
                 summary.get("f2_wait_loss", float("nan")),
-                new_hits, new_misses,
+                new_hits, new_misses, len(trace),
             )
 
             all_summaries[variant_name].append(summary)
@@ -613,6 +864,11 @@ def run_real_llm_comparison(
 
             rec_path = root / f"records_{variant_name}_seed{seed}.csv"
             pd.DataFrame(records).to_csv(rec_path, index=False)
+
+            if trace:
+                trace_path = root / f"spsa_trace_{variant_name}_seed{seed}.csv"
+                pd.DataFrame(trace).to_csv(trace_path, index=False)
+                logger.info("  SPSA trace → %s", trace_path)
 
     # ------------------------------------------------------------------
     # Aggregate + outputs
@@ -629,8 +885,10 @@ def run_real_llm_comparison(
         encoding="utf-8",
     )
 
-    _plot_bar(agg_rows, root / "real_llm_comparison.png")
-    _plot_convergence(all_records, root / "real_llm_convergence.png")
+    _plot_bar(agg_rows, root / "fig_comparison_bar.png")
+    _plot_convergence(all_records, root / "fig_convergence_routing.png")
+    _plot_multimetric(all_records, root / "fig_convergence_multi.png")
+    _plot_spsa_traces(root, variants, seeds)
     _print_table(agg_rows)
 
     final_stats = caching_client.cache_stats()
@@ -650,18 +908,27 @@ def _parse_args() -> argparse.Namespace:
         description="Real-LLM validation with shared execution cache.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--tasks",    type=int,  default=60)
+    p.add_argument("--tasks",    type=int,  default=200,
+                   help="Number of tasks per seed (200 recommended for SPSA convergence).")
     p.add_argument("--seeds",    type=str,  default="11,42,123")
     p.add_argument("--variants", type=str,  default=",".join(SPSA_VARIANTS))
     p.add_argument("--output-dir", type=str, default="real_llm_outputs")
+    p.add_argument("--config",   type=str,  default="llm_config",
+                   help="Config module name: 'llm_config' (Groq+OpenAI) or "
+                        "'llm_config_openrouter' (Groq+OpenRouter free).")
     p.add_argument("--dry-run",  action="store_true",
-                   help="Send one test call and exit.")
-    p.add_argument("--rate-interval", type=float, default=2.5,
+                   help="Send one test call per model and exit.")
+    p.add_argument("--rate-interval", type=float, default=3.0,
                    help="Min seconds between consecutive real API calls.")
     p.add_argument("--controllers", type=int, default=3)
     p.add_argument("--agents",      type=int, default=5)
     p.add_argument("--cache-file",  type=str, default=None,
                    help="Path to a previously saved execution_cache_*.json to resume.")
+    p.add_argument("--log-file",      type=str, default=None,
+                   help="Write full logs (incl. DEBUG SPSA params) to this file.")
+    p.add_argument("--spsa-interval", type=int, default=5,
+                   help="Call SPSA every N tasks (default 5 → 38 steps/200 tasks; "
+                        "use 1 for ~185 steps/200 tasks).")
     return p.parse_args()
 
 
@@ -677,4 +944,7 @@ if __name__ == "__main__":
         num_ctrl        = args.controllers,
         num_agents      = args.agents,
         cache_file      = args.cache_file,
+        config_name     = args.config,
+        log_file        = args.log_file,
+        spsa_interval   = args.spsa_interval,
     )

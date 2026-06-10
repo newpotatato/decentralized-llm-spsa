@@ -15,13 +15,36 @@ SPSA-аналоги: 7 алгоритмов распределённой опт�
     pd_1pt  — Yi et al., IEEE TAC 2021
 """
 
+import logging
 import numpy as np
 from typing import Dict, Any, List
+
+logger = logging.getLogger(__name__)
 
 # =============================================================================
 # Персистентное состояние между вызовами (моментум, трекеры градиентов)
 # =============================================================================
 _STATE: Dict[str, Dict[int, Any]] = {}
+
+# =============================================================================
+# Per-step parameter trace (collected when trace is enabled).
+# Each entry: {step, variant, alpha_k/alpha_t, kappa_k, pert, grad_norm_mean}
+# =============================================================================
+_TRACE_LOG: List[Dict[str, Any]] = []
+_TRACE_ENABLED: bool = False
+
+
+def enable_trace(flag: bool = True) -> None:
+    global _TRACE_ENABLED
+    _TRACE_ENABLED = flag
+
+
+def clear_trace() -> None:
+    _TRACE_LOG.clear()
+
+
+def get_trace() -> List[Dict[str, Any]]:
+    return list(_TRACE_LOG)
 
 
 def _st(algo: str) -> Dict[int, Any]:
@@ -104,7 +127,10 @@ def _row_stochastic(B: np.ndarray) -> np.ndarray:
     W = B.copy()
     for i in range(W.shape[0]):
         rs = W[i].sum()
-        W[i, i] = max(0.0, 1.0 - rs)
+        if rs <= 1.0:
+            W[i, i] = 1.0 - rs   # добавляем self-weight
+        else:
+            W[i] /= rs            # нормализуем строку (off-diagonal уже > 1)
     return W
 
 
@@ -212,10 +238,11 @@ def _aspsa_step(
         zb_t = S[cid]["z_bar_t"]
         zb_w = S[cid]["z_bar_w"]
 
-        # Probing point: x̃ = (r·z̄ + θ̄) / (r+1)
-        denom = r + 1.0
-        xt_t  = (r * zb_t + tb_t) / denom
-        xt_w  = (r * zb_w + tb_w) / denom
+        # Probing point per paper Eq (12):
+        # x̃_k = (α_k·γ_{k-1}·z̄ + γ_k·θ̄) / (γ_{k-1} + α_k·(μ-η))
+        denom = kappa_prev + alpha_k * mu_eta   # γ_{k-1} + α_k·(μ-η)
+        xt_t  = (alpha_k * kappa_prev * zb_t + kappa_k * tb_t) / denom
+        xt_w  = (alpha_k * kappa_prev * zb_w + kappa_k * tb_w) / denom
 
         # SPSA gradient estimate at x̃ — shared perturbation direction for F1 and F2
         d = 2 * np.random.randint(0, 2, dim) - 1   # one Rademacher draw, used for both
@@ -249,6 +276,16 @@ def _aspsa_step(
 
     alg["kappa"]      = kappa_k
     alg["prev_alpha"] = alpha_k
+
+    logger.debug(
+        "[A-SPSA tag=%s] step=%d  alpha_k=%.5f  kappa_k=%.5f  pert=%.5f",
+        tag, step, alpha_k, kappa_k, pert,
+    )
+    if _TRACE_ENABLED:
+        _TRACE_LOG.append({
+            "step": step, "variant": tag,
+            "alpha_k": float(alpha_k), "kappa_k": float(kappa_k), "pert": float(pert),
+        })
 
     for ctrl, t, w in zip(controllers, new_t, new_w):
         ctrl.theta_time = _clip_t(t)
@@ -289,6 +326,9 @@ def kw_consensus(
     B = _comm_graph(step, len(controllers))
     alpha_t = _decay_alpha(step, alpha)
     pert    = _decay_pert(step, beta)
+    logger.debug("[KW] step=%d  alpha_t=%.5f  pert=%.5f", step, alpha_t, pert)
+    if _TRACE_ENABLED:
+        _TRACE_LOG.append({"step": step, "variant": "kw", "alpha_k": float(alpha_t), "kappa_k": float("nan"), "pert": float(pert)})
     new_t, new_w = [], []
 
     for j, ctrl in enumerate(controllers):
@@ -339,6 +379,9 @@ def zo_pgd_consensus(
     B = _comm_graph(step, len(controllers))
     alpha_t = _decay_alpha(step, alpha)
     sigma   = _decay_pert(step, beta)
+    logger.debug("[ZO-PGD] step=%d  alpha_t=%.5f  sigma=%.5f", step, alpha_t, sigma)
+    if _TRACE_ENABLED:
+        _TRACE_LOG.append({"step": step, "variant": "zo_pgd", "alpha_k": float(alpha_t), "kappa_k": float("nan"), "pert": float(sigma)})
     new_t, new_w = [], []
 
     for j, ctrl in enumerate(controllers):
@@ -398,6 +441,9 @@ def sp_gt_consensus(
     W = _row_stochastic(B)
     alpha_t = _decay_alpha(step, alpha)
     sigma   = _decay_pert(step, beta)
+    logger.debug("[SP-GT] step=%d  alpha_t=%.5f  sigma=%.5f", step, alpha_t, sigma)
+    if _TRACE_ENABLED:
+        _TRACE_LOG.append({"step": step, "variant": "sp_gt", "alpha_k": float(alpha_t), "kappa_k": float("nan"), "pert": float(sigma)})
 
     # Текущие значения y для averaging — фиксируем до обновления
     y_t_cur = {ctrl.id: S.get(ctrl.id, {}).get("y_t", np.zeros_like(ctrl.theta_time))
@@ -427,9 +473,10 @@ def sp_gt_consensus(
         u_t = np.random.randn(dim); u_t /= np.linalg.norm(u_t) + 1e-8
         u_w = np.random.randn(dim); u_w /= np.linalg.norm(u_w) + 1e-8
 
-        # Одноточечный сферический оценщик: (d/σ²)·f(θ+σu)·u
-        g_t = (dim / sigma ** 2) * _proc_loss(ctrl.theta_time + sigma * u_t, ctrl.obs_history) * u_t
-        g_w = (dim / sigma ** 2) * _wait_loss(ctrl.theta_wait + sigma * u_w, ctrl.obs_history) * u_w
+        # Одноточечный сферический оценщик: (d/σ)·f(θ+σu)·u  (Mhanna & Assaad ICML 2023)
+        # Наша статья пишет d/σ² — вероятно опечатка: d/σ² даёт растущий шаг и расходится.
+        g_t = (dim / sigma) * _proc_loss(ctrl.theta_time + sigma * u_t, ctrl.obs_history) * u_t
+        g_w = (dim / sigma) * _wait_loss(ctrl.theta_wait + sigma * u_w, ctrl.obs_history) * u_w
 
         nbrs = np.where(B[j] > 0)[0]
 
@@ -485,6 +532,9 @@ def zo_gt_consensus(
     W = _row_stochastic(B)
     alpha_t = _decay_alpha(step, alpha)
     pert    = _decay_pert(step, beta)
+    logger.debug("[ZO-GT] step=%d  alpha_t=%.5f  pert=%.5f", step, alpha_t, pert)
+    if _TRACE_ENABLED:
+        _TRACE_LOG.append({"step": step, "variant": "zo_gt", "alpha_k": float(alpha_t), "kappa_k": float("nan"), "pert": float(pert)})
 
     y_t_cur = {ctrl.id: S.get(ctrl.id, {}).get("y_t", np.zeros_like(ctrl.theta_time))
                for ctrl in controllers}
@@ -578,6 +628,9 @@ def pd_bandit_twopoint(
     B = _comm_graph(step, len(controllers))
     alpha_t = _decay_alpha(step, alpha)
     sigma   = _decay_pert(step, beta)
+    logger.debug("[PD-2pt] step=%d  alpha_t=%.5f  sigma=%.5f", step, alpha_t, sigma)
+    if _TRACE_ENABLED:
+        _TRACE_LOG.append({"step": step, "variant": "pd_2pt", "alpha_k": float(alpha_t), "kappa_k": float("nan"), "pert": float(sigma)})
     new_t, new_w = [], []
 
     for j, ctrl in enumerate(controllers):
@@ -646,6 +699,9 @@ def pd_bandit_onepoint(
     B = _comm_graph(step, len(controllers))
     alpha_t = _decay_alpha(step, alpha)
     sigma   = _decay_pert(step, beta)
+    logger.debug("[PD-1pt] step=%d  alpha_t=%.5f  sigma=%.5f", step, alpha_t, sigma)
+    if _TRACE_ENABLED:
+        _TRACE_LOG.append({"step": step, "variant": "pd_1pt", "alpha_k": float(alpha_t), "kappa_k": float("nan"), "pert": float(sigma)})
     new_t, new_w = [], []
 
     for j, ctrl in enumerate(controllers):

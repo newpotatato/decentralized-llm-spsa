@@ -69,7 +69,10 @@ class LLMAPIClient:
         }
         payload = {
             "model": remote_model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant. Respond in plain text only. Do not call any functions or tools."},
+                {"role": "user", "content": prompt},
+            ],
             "max_tokens": self.max_tokens_per_model.get(model_name, self.max_tokens),
         }
 

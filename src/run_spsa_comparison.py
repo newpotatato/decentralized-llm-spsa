@@ -64,15 +64,15 @@ ABLATION_LABELS = {
 }
 
 COLORS = {
-    "spsa":              "#1f77b4",
-    "aspsa":             "#d62728",   # A-SPSA highlighted in red
-    "aspsa_no_momentum": "#aec7e8",   # pale blue — ablated
-    "aspsa_fixed_beta":  "#ffbb78",   # pale orange — ablated
-    "kw":                "#2ca02c",
-    "zo_pgd":            "#ff7f0e",
-    "sp_gt":             "#9467bd",
-    "zo_gt":             "#8c564b",
-    "pd_2pt":            "#17becf",
+    "spsa":              "#457B9D",
+    "aspsa":             "#E63946",
+    "aspsa_no_momentum": "#A8DADC",
+    "aspsa_fixed_beta":  "#95D5B2",
+    "kw":                "#2A9D8F",
+    "zo_pgd":            "#E9C46A",
+    "sp_gt":             "#8338EC",
+    "zo_gt":             "#FB8500",
+    "pd_2pt":            "#F72585",
 }
 
 SCENARIO_TEMPLATES = {
@@ -181,6 +181,20 @@ def generate_nonstationary_tasks(num_tasks: int, seed: int) -> list:
 
 # Best (alpha, beta) per variant — populated by run_tuning(), used by all experiments.
 BEST_PARAMS: dict[str, dict] = {}
+
+# Hyperparameters from Table 1 of the paper (verified on 500-task, n=5, m=3 runs).
+# Use --use-paper-params to skip grid search and load these directly.
+PAPER_PARAMS: dict[str, dict] = {
+    "aspsa":             dict(alpha=0.10, beta=0.30, beta_nes_max=0.30),
+    "spsa":              dict(alpha=0.70, beta=0.05, beta_nes_max=1.0),
+    "kw":                dict(alpha=1.00, beta=0.30, beta_nes_max=1.0),
+    "zo_pgd":            dict(alpha=0.50, beta=0.10, beta_nes_max=1.0),
+    "sp_gt":             dict(alpha=0.10, beta=0.30, beta_nes_max=1.0),
+    "zo_gt":             dict(alpha=0.10, beta=0.30, beta_nes_max=1.0),
+    "pd_2pt":            dict(alpha=0.05, beta=0.10, beta_nes_max=1.0),
+    "aspsa_no_momentum": dict(alpha=0.10, beta=0.30, beta_nes_max=1.0),
+    "aspsa_fixed_beta":  dict(alpha=0.10, beta=0.30, beta_nes_max=1.0),
+}
 
 ALPHA_TUNE_GRID    = [0.05, 0.1, 0.2, 0.5, 0.7, 1.0]
 
@@ -304,15 +318,15 @@ def tune_variant(variant_name: str, val_tasks: list, num_ctrl: int,
 def run_tuning(num_tasks: int, seeds: list, num_ctrl: int, num_agents: int,
                output_dir: Path) -> dict[str, dict]:
     """Tune all SPSA variants + ablation variants on a shared val split (parallel grid search).
-    
-    IMPORTANT: Uses a separate validation seed (-1) to ensure independence from evaluation seeds.
+
+    IMPORTANT: Uses a separate validation seed (999) to ensure independence from evaluation seeds.
     This prevents data leakage and ensures fair hyperparameter selection.
     """
     global BEST_PARAMS
-    print("\n[TUNE] Grid search over (α, β) on validation split (independent seed -1, first 20% of tasks)...")
-    
+    print("\n[TUNE] Grid search over (α, β) on validation split (independent seed 999, first 20% of tasks)...")
+
     # Use a dedicated validation seed INDEPENDENT of evaluation seeds
-    val_seed = -1
+    val_seed = 999
     all_tasks = _get_tasks(num_tasks, val_seed)
     val_size  = max(30, num_tasks // 5)
     val_tasks = all_tasks[:val_size]
@@ -736,7 +750,7 @@ def run_e5(num_tasks: int, seeds: list, num_ctrl: int, num_agents: int, output_d
 # E7: Hyperparameter sensitivity (α scale) + θ-trajectory export
 # ---------------------------------------------------------------------------
 
-ALPHA_GRID = [0.002, 0.005, 0.01, 0.02, 0.05, 0.1]
+ALPHA_GRID = [0.005, 0.01, 0.02, 0.05, 0.10, 0.15, 0.20, 0.30, 0.50]
 
 
 def _run_with_alpha(variant_name: str, tasks: list, num_ctrl: int, num_agents: int,
@@ -843,16 +857,41 @@ def run_e7(num_tasks: int, seeds: list, num_ctrl: int, num_agents: int, output_d
 # Entry point
 # ---------------------------------------------------------------------------
 
+def use_paper_params(output_dir: Path) -> None:
+    """Skip grid search — load verified paper hyperparameters directly."""
+    global BEST_PARAMS
+    BEST_PARAMS = {k: dict(v) for k, v in PAPER_PARAMS.items()}
+    rows = []
+    for vname, p in BEST_PARAMS.items():
+        rows.append({
+            "variant": vname,
+            "description": VARIANT_DESCRIPTIONS.get(vname, vname),
+            "best_alpha": p["alpha"],
+            "best_beta": p["beta"],
+            "best_beta_nes_max": p.get("beta_nes_max"),
+            "val_success_rate": "paper",
+        })
+    pd.DataFrame(rows).to_csv(output_dir / "hyperparameters.csv", index=False)
+    print("[PARAMS] Using paper hyperparameters (Table 1) — grid search skipped.")
+    for vname, p in BEST_PARAMS.items():
+        bnm = f"  bnm={p['beta_nes_max']:.2f}" if vname == "aspsa" else ""
+        print(f"  {vname:22s}  alpha={p['alpha']:.3f}  beta={p['beta']:.3f}{bnm}")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="SPSA variant comparison experiments for the paper.")
-    parser.add_argument("--tasks", type=int, default=500)
-    parser.add_argument("--seeds", type=str, default="11,42,123,7,99")
-    parser.add_argument("--controllers", type=int, default=3)
-    parser.add_argument("--agents", type=int, default=5)
+    parser.add_argument("--tasks", type=int, default=1000)
+    parser.add_argument("--seeds", type=str, default="11,42,123,7,99,17,88")
+    parser.add_argument("--controllers", type=int, default=5)
+    parser.add_argument("--agents", type=int, default=8)
     parser.add_argument("--output-dir", type=str, default="spsa_comparison")
     parser.add_argument(
         "--experiments", type=str, default="E6,E1,E2,E3,E4,E5,E7",
         help="Comma-separated subset, e.g. E6,E1,E7"
+    )
+    parser.add_argument(
+        "--use-paper-params", action="store_true",
+        help="Skip hyperparameter tuning and use verified paper params (Table 1)."
     )
     return parser.parse_args()
 
@@ -869,8 +908,11 @@ if __name__ == "__main__":
 
     kw = dict(num_tasks=args.tasks, seeds=seeds, num_ctrl=args.controllers, num_agents=args.agents, output_dir=output_dir)
 
-    # Tuning always runs first — its results flow into all experiments via BEST_PARAMS.
-    run_tuning(**kw)
+    if args.use_paper_params:
+        use_paper_params(output_dir)
+    else:
+        # Tuning always runs first — its results flow into all experiments via BEST_PARAMS.
+        run_tuning(**kw)
 
     if "E6" in experiments:
         run_e6(**kw)

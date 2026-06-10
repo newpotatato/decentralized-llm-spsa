@@ -12,6 +12,8 @@ build/
 
 # API keys — never commit the real config
 src/llm_config.py
+src/llm_config_groq.py
+src/llm_config_openrouter.py
 
 # Paper LaTeX sources (not published yet)
 paper/
@@ -23,11 +25,30 @@ data/
 ablation_run_outputs/
 ablation_error_run/
 spsa_comparison/
+spsa_comparison_v2/
+spsa_comparison_v3/
+spsa_comparison_v4/
+spsa_comparison_v5/
 real_llm_outputs/
+real_llm_outputs_groq/
+real_llm_outputs_groq_interval1/
+real_llm_outputs_groq_s42/
+real_llm_outputs_groq_s123/
+real_llm_outputs_v2/
+real_llm_outputs_v3/
+openrouter_run/
 _smoke*/
 single_run_outputs/
 comparison_outputs/
 benchmark_suite_results/
+new_results/
+for_supervisor/
+viz/
+_test_paper_params/
+conv_data.json
+lecture_presentation.html
+FAQ_experiments.md
+numerical_experiments.md
 
 # Jupyter
 *.ipynb

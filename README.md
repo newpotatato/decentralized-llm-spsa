@@ -1,8 +1,6 @@
 # Accelerated Parameter Balancing for Decentralized Multi-LLM Orchestration
 
-**ApPLIED '26 — Workshop on Applied Distributed Computing**
-
-> Tarasova A., Chernikov K. et al., 2026
+*Anonymous submission*
 
 ## Abstract
 

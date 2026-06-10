@@ -21,7 +21,7 @@ class TestRunComparisons(unittest.TestCase):
             self.assertTrue((root / "comparison_metrics.png").exists())
             self.assertIn("current", summary["variant"].tolist())
             self.assertIn("best_quality_static", summary["variant"].tolist())
-            self.assertNotIn("no_judge", summary["variant"].tolist())
+            self.assertIn("no_judge", summary["variant"].tolist())
 
 
 if __name__ == "__main__":

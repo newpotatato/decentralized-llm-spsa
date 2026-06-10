@@ -77,17 +77,32 @@ PROFILES = [
                 np.array([1.8, 2.0, 2.1, 1.7, 2.5]), 
                 np.array([0.75,0.85,0.8,0.7,0.75])),
     AgentProfile(4, "Qwen2.5-ToolUse", "qwen2.5-tooluse",
-                np.array([0.55, 0.60, 0.65, 0.58, 0.92]), 
-                np.array([3.5, 3.0, 2.8, 3.2, 1.5]), 
-                np.array([0.3,0.4,0.5,0.4,0.95]))
+                np.array([0.55, 0.60, 0.65, 0.58, 0.92]),
+                np.array([3.5, 3.0, 2.8, 3.2, 1.5]),
+                np.array([0.3,0.4,0.5,0.4,0.95])),
+    AgentProfile(5, "Mixtral-8x7B-Instruct", "mixtral-8x7b-instruct",
+                np.array([0.80, 0.84, 0.79, 0.83, 0.72]),
+                np.array([1.6, 1.9, 2.0, 1.4, 2.6]),
+                np.array([0.82,0.88,0.80,0.78,0.65])),
+    AgentProfile(6, "CodeLlama-34B-Instruct", "codellama-34b-instruct",
+                np.array([0.91, 0.58, 0.50, 0.45, 0.40]),
+                np.array([2.8, 4.2, 4.8, 5.0, 5.2]),
+                np.array([0.93,0.38,0.28,0.18,0.12])),
+    AgentProfile(7, "Phi-3-Mini-Instruct", "phi-3-mini-instruct",
+                np.array([0.58, 0.70, 0.68, 0.64, 0.55]),
+                np.array([0.9, 1.1, 1.0, 0.8, 1.3]),
+                np.array([0.60,0.75,0.72,0.68,0.50])),
 ]
 
 MODEL_TOKEN_PRICE = {
-    "llama3-8b-instruct": 0.20,
-    "deepseek-coder-v2": 0.28,
-    "qwen2.5-72b-instruct": 0.85,
-    "mistral-7b-instruct": 0.22,
-    "qwen2.5-tooluse": 0.90,
+    "llama3-8b-instruct":     0.20,
+    "deepseek-coder-v2":      0.28,
+    "qwen2.5-72b-instruct":   0.85,
+    "mistral-7b-instruct":    0.22,
+    "qwen2.5-tooluse":        0.90,
+    "mixtral-8x7b-instruct":  0.45,
+    "codellama-34b-instruct": 0.35,
+    "phi-3-mini-instruct":    0.10,
 }
 
 # =============================================================================
@@ -430,7 +445,7 @@ def t_free_k(agent: AgentState, time: float, profile: AgentProfile) -> float:
     """
     queue = agent.queue or []
     if len(queue) == 0:
-        return 0.0
+        return max(0.0, agent.available_at - time)
 
     # Индекс текущей задачи (если известна), иначе считаем первой в очереди.
     active_idx = 0

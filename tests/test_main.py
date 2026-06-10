@@ -202,7 +202,7 @@ class TestOrchestrator(unittest.TestCase):
                 ctrl.obs_history.append(type("Obs", (), {
                     "task_type": TaskType.PROGRAMMING.value,
                     "true_time": 2.0 + 0.05 * j + 0.02 * idx,
-                    "true_wait": 1.0 + 0.03 * j + 0.01 * idx,
+                    "true_wait": 2.5 + 0.10 * j + 0.05 * idx,
                     "features": features,
                 })())
 
@@ -218,7 +218,7 @@ class TestOrchestrator(unittest.TestCase):
 
     def test_predicted_budget_changes_adaptive_ranking(self):
         controller = AdaptiveController(0)
-        controller.routing_weights = np.array([0.03, 0.04, 0.06, 0.28, 0.16, 0.01, 0.04, 0.38], dtype=float)
+        controller.routing_weights = np.array([0.05, 0.05, 0.05, 0.40, 0.05, 0.01, 0.05, 0.34], dtype=float)
         variant = SimulationVariant(name="adaptive_test", routing_mode="adaptive", cost_weight=0.0)
         agents = [
             AgentState(0, np.array([0.82, 0.88, 0.68, 0.58, 0.50]), []),

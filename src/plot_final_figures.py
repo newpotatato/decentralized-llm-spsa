@@ -25,33 +25,37 @@ warnings.filterwarnings("ignore")
 # ---------------------------------------------------------------------------
 # Style
 # ---------------------------------------------------------------------------
+plt.style.use("seaborn-v0_8-whitegrid")
 plt.rcParams.update({
-    "font.family":      "serif",
-    "font.serif":       ["DejaVu Serif", "Times New Roman"],
-    "font.size":        11,
-    "axes.titlesize":   12,
-    "axes.labelsize":   11,
-    "xtick.labelsize":  9,
-    "ytick.labelsize":  9,
-    "legend.fontsize":  9,
-    "figure.dpi":       150,
-    "axes.spines.top":  False,
-    "axes.spines.right":False,
-    "axes.grid":        True,
-    "grid.alpha":       0.3,
-    "grid.linestyle":   "--",
+    "font.family":       "sans-serif",
+    "font.sans-serif":   ["DejaVu Sans", "Arial", "Helvetica"],
+    "font.size":         11,
+    "axes.titlesize":    12,
+    "axes.labelsize":    11,
+    "xtick.labelsize":   9,
+    "ytick.labelsize":   9,
+    "legend.fontsize":   9,
+    "figure.dpi":        150,
+    "axes.spines.top":   False,
+    "axes.spines.right": False,
+    "axes.edgecolor":    "#888888",
+    "axes.linewidth":    0.8,
+    "grid.alpha":        0.4,
+    "grid.linestyle":    ":",
+    "grid.color":        "#cccccc",
+    "patch.linewidth":   0.5,
 })
 
 COLORS = {
-    "aspsa":             "#d62728",
-    "spsa":              "#1f77b4",
-    "kw":                "#2ca02c",
-    "zo_pgd":            "#ff7f0e",
-    "sp_gt":             "#9467bd",
-    "zo_gt":             "#8c564b",
-    "pd_2pt":            "#e377c2",
-    "aspsa_no_momentum": "#bcbd22",
-    "aspsa_fixed_beta":  "#17becf",
+    "aspsa":             "#E63946",
+    "spsa":              "#457B9D",
+    "kw":                "#2A9D8F",
+    "zo_pgd":            "#E9C46A",
+    "sp_gt":             "#8338EC",
+    "zo_gt":             "#FB8500",
+    "pd_2pt":            "#F72585",
+    "aspsa_no_momentum": "#A8DADC",
+    "aspsa_fixed_beta":  "#95D5B2",
 }
 
 LABELS = {
