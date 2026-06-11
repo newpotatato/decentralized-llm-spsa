@@ -90,24 +90,6 @@ python -m src.plot_real_llm        # real-LLM figures   → paper/figs/
 cd paper && pdflatex main.tex && bibtex main && pdflatex main.tex && pdflatex main.tex
 ```
 
-## Citation
-
-```bibtex
-@inproceedings{tarasova2026aspsa,
-  title     = {Accelerated Parameter Balancing for Decentralized Multi-{LLM} Orchestration},
-  author    = {Tarasova, A. and Chernikov, K. and others},
-  booktitle = {Proceedings of the Workshop on Applied Distributed Computing (ApPLIED '26)},
-  year      = {2026},
-}
-```
-
-## Related Work
-
-This paper extends:
-- Tarasova et al., *Scientific Reports* 2025 — [DOI:10.1038/s41598-025-21709-9](https://doi.org/10.1038/s41598-025-21709-9)
-- Erofeeva 2026 — A-SPSA algorithm (quadratic surrogate + Nesterov momentum)
-- Granichin 2021 — baseline distributed SPSA with consensus
-
 ## License
 
 MIT
