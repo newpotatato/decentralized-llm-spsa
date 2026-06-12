@@ -1,4 +1,4 @@
-# Accelerated Parameter Balancing for Decentralized Multi-LLM Orchestration
+# Adaptive Decentralized Multi-LLM Orchestration with Accelerated Consensus-Based SPSA
 
 *Anonymous submission*
 
