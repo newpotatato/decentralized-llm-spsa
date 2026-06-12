@@ -4,22 +4,17 @@
 
 ## Abstract
 
-We study the problem of online parameter balancing in a decentralized multi-LLM
-task orchestration system operating under partial observability and bounded disturbances.
-Building on a prior two-layer architecture — in which adaptive controllers predict
-task parameters via recursive least squares and synchronize models via SPSA-based
-consensus — we replace the baseline distributed SPSA with an accelerated
-consensus-based variant (A-SPSA) that incorporates a Nesterov momentum term and a
-quadratic surrogate function.
-We evaluate the adaptation in a high-fidelity simulation with five heterogeneous
-LLM agent profiles across seven zeroth-order distributed optimization algorithms
-using three metrics designed to capture routing quality, deadline compliance, and
-wait-prediction accuracy; the simulation uses real task prompts drawn from five
-public benchmarks (MBPP, TriviaQA, XSum, OPUS-100, Hermes-FC) and is further
-validated on live LLM API calls via a shared-execution-cache protocol.
-A-SPSA achieves the highest deadline hit rate and lowest wait-prediction loss
-among all compared methods, and ranks first on routing objective with statistically
-significant gains over four of six baselines.
+Adaptive routing in multi-LLM systems is difficult to evaluate reliably because different policies may observe different model outputs,
+latencies, costs, and judge scores. We introduce a replay-based evaluation protocol that fixes both the task stream and the potential
+outcome of each task–agent pair, allowing routing policies to be compared under identical conditions. Within this framework, we adapt
+accelerated consensus-based simultaneous perturbation stochastic approximation (A-SPSA) to the online optimization of controller
+parameters used for processing-time and wait-time prediction. The method combines two-point zeroth-order feedback, accelerated
+surrogate updates, and consensus among distributed controllers. We evaluate A-SPSA against six distributed zeroth-order baselines in
+a discrete-event simulation with heterogeneous agents, and further validate the policies using cached outputs from real LLM endpoints.
+The experiments include aggregate comparison, component-level ablation, and hyperparameter sensitivity analysis. A-SPSA achieves
+the strongest overall balance between routing objective, deadline hit rate, and wait-time prediction error, while the ablation results
+show that lower intermediate prediction loss does not necessarily lead to better downstream routing decisions. The proposed protocol
+provides a reproducible basis for evaluating adaptive agent-routing policies under stochastic and partially observable conditions
 
 ## Repository Structure
 
