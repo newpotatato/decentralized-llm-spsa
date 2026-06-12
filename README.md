@@ -14,7 +14,7 @@ a discrete-event simulation with heterogeneous agents, and further validate the 
 The experiments include aggregate comparison, component-level ablation, and hyperparameter sensitivity analysis. A-SPSA achieves
 the strongest overall balance between routing objective, deadline hit rate, and wait-time prediction error, while the ablation results
 show that lower intermediate prediction loss does not necessarily lead to better downstream routing decisions. The proposed protocol
-provides a reproducible basis for evaluating adaptive agent-routing policies under stochastic and partially observable conditions
+provides a reproducible basis for evaluating adaptive agent-routing policies under stochastic and partially observable conditions.
 
 ## Repository Structure
 
