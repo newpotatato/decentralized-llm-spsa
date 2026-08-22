@@ -638,3 +638,81 @@ def test_resolution_floor_accounts_for_discarded_zero_differences(tmp_path):
     assert int(row.effective_pairs) == 9
     assert np.isclose(row.p_resolution_floor, 2.0 / 2 ** 9)
     assert bool(row.p_at_resolution_floor)
+
+
+# --------------------------------------------------------------------------
+# Stream heterogeneity and out-of-window accuracy
+# --------------------------------------------------------------------------
+
+def test_domain_assignment_gives_controllers_disjoint_streams():
+    """The manuscript motivates synchronization with divergent local streams.
+
+    Under load-based assignment every controller draws from one common
+    distribution, so their models differ only by sampling noise and there is
+    nothing for synchronization to transfer.  Domain ownership instantiates the
+    situation the method is designed for.
+    """
+    tasks = synthetic_tasks(120)
+    shared = dict(controllers=3, agents=6, seed=5, warmup=10, sync_interval=5,
+                  architecture="fixed_replay", optimizer="spsa")
+    balanced = ControlledReplayExperiment(
+        tasks, ExperimentConfig(controller_assignment="load", **shared)
+    ).run()
+    partitioned = ControlledReplayExperiment(
+        tasks, ExperimentConfig(controller_assignment="domain", **shared)
+    ).run()
+    assert np.isclose(partitioned["domain_mix_total_variation"], 1.0)
+    assert balanced["domain_mix_total_variation"] < 0.5
+
+
+def test_true_processing_error_is_reported_and_is_not_the_windowed_loss():
+    """Phi is an in-sample loss on a rolling window; this is held-out accuracy.
+
+    A model can drive the windowed objective down while moving away from the
+    relationship that generated the data, so the two must be reported side by
+    side and must not be assumed to move together.
+    """
+    tasks = synthetic_tasks(120)
+    shared = dict(controllers=3, agents=6, seed=5, warmup=10, sync_interval=5,
+                  architecture="fixed_replay")
+    frozen = ControlledReplayExperiment(
+        tasks,
+        ExperimentConfig(optimizer="none", use_learning=False, use_rls=False, **shared),
+    ).run()
+    fitted = ControlledReplayExperiment(
+        tasks, ExperimentConfig(optimizer="local_rls", **shared)
+    ).run()
+
+    for summary in (frozen, fitted):
+        for key in ("true_processing_rmse", "true_processing_mape",
+                    "domain_mix_total_variation"):
+            assert key in summary and np.isfinite(summary[key])
+
+    # Fitting lowers the windowed objective ...
+    assert fitted["local_p_final"] < frozen["local_p_final"]
+    # ... and the two quantities are genuinely different measurements, so a
+    # drop in one must never be reported as evidence about the other.
+    assert not np.isclose(fitted["true_processing_rmse"], fitted["local_p_final"])
+
+
+def test_frozen_prior_recovers_the_truth_better_than_the_fitted_model():
+    """Documents the overfitting regime the benchmark currently sits in.
+
+    108 processing parameters against roughly 80 observations per controller,
+    with a median of one sample per (agent, domain) cell: recursive least
+    squares reduces the rolling-window loss while increasing the error against
+    the generative model.  If this ever stops holding, the budget or the
+    parameterisation has changed and the audit needs revisiting.
+    """
+    tasks = synthetic_tasks(240)
+    shared = dict(controllers=3, agents=12, seed=11, warmup=10, sync_interval=5,
+                  architecture="fixed_replay")
+    frozen = ControlledReplayExperiment(
+        tasks,
+        ExperimentConfig(optimizer="none", use_learning=False, use_rls=False, **shared),
+    ).run()
+    fitted = ControlledReplayExperiment(
+        tasks, ExperimentConfig(optimizer="local_rls", **shared)
+    ).run()
+    assert fitted["local_p_final"] < frozen["local_p_final"]
+    assert fitted["true_processing_rmse"] > frozen["true_processing_rmse"]

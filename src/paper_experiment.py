@@ -112,6 +112,16 @@ class ExperimentConfig:
     optimizer_config: OptimizerConfig = field(default_factory=OptimizerConfig)
     optimizer_configs: ModelOptimizerConfigs | None = None
     optimizer_blocks: tuple[str, ...] = ("processing", "waiting", "quality")
+    # How a task is assigned to a responsible controller.
+    #   "load"   - least-loaded controller, independent of the task domain.
+    #              Every controller then sees i.i.d. draws from one common
+    #              distribution, so their models differ only by sampling noise
+    #              and there is nothing for synchronization to transfer.
+    #   "domain" - controllers own disjoint domain groups, which is the
+    #              situation the manuscript motivates synchronization with: a
+    #              controller never observes the domains it does not route, so
+    #              those parameters can only improve through its neighbours.
+    controller_assignment: str = "load"
     # omega is calibrated so the disagreement penalty is commensurate with the
     # local losses it regularises.  At omega = 0.05 the penalty reached 0.6-1.9
     # while the whole local objective was 0.02-0.18, so Phi ranked methods by
@@ -132,6 +142,8 @@ class ExperimentConfig:
             raise ValueError("optimizer_blocks must select processing/waiting/quality")
         if len(self.network_omega) != 3 or any(weight < 0.0 for weight in self.network_omega):
             raise ValueError("network_omega must contain three non-negative coefficients")
+        if self.controller_assignment not in {"load", "domain"}:
+            raise ValueError("controller_assignment must be load or domain")
         if self.architecture not in {
             "legacy_local_queue", "random", "static_skill", "shortest_queue",
             "global_greedy", "global_exact", "centralized_exact", "oracle",
@@ -353,6 +365,29 @@ class PaperController:
         )
         return f1 + f2 + f3
 
+    def true_processing_error(self, agents: list[AgentSpec]) -> tuple[float, float]:
+        """RMSE and MAPE of the processing model against the generative truth.
+
+        The rolling-window objective is an *in-sample* loss over the last
+        observations of the pairs this controller happened to select, so a
+        model can drive it down while moving away from the relationship that
+        generated the data.  This measures the latter directly, over every
+        (agent, domain, hardness) cell including those never observed.
+        """
+        errors, relative = [], []
+        for agent_id, agent in enumerate(agents):
+            for domain in range(len(DOMAIN_ORDER)):
+                for hardness in DIFFICULTY.values():
+                    features = np.zeros(self.feature_dim)
+                    features[domain] = 1.0
+                    features[len(DOMAIN_ORDER)] = hardness
+                    truth = float(agent.mean_service[domain]) * (1.0 + 0.70 * hardness)
+                    prediction = float(self.theta_time[agent_id] @ features)
+                    errors.append(prediction - truth)
+                    relative.append(abs(prediction - truth) / max(truth, 1e-9))
+        errors = np.asarray(errors, dtype=float)
+        return float(np.sqrt(np.mean(errors**2))), float(np.mean(relative))
+
     def current_losses(self) -> tuple[float, float, float]:
         return mean_losses(
             list(self.observations),
@@ -484,10 +519,44 @@ class ControlledReplayExperiment:
             metrics[f"phi_{short_name}"] = float(local_sum + omega[block_name] * disagreement)
         return metrics
 
-    def _controller_for(self) -> PaperController:
+    def _generalization_metrics(self) -> dict[str, float]:
+        """Out-of-window accuracy of the processing model, and stream skew.
+
+        ``domain_mix_total_variation`` is the largest pairwise total variation
+        between the controllers' realised domain distributions.  Under
+        load-based assignment it reflects finite-sample noise only; under
+        domain ownership it is the designed heterogeneity.
+        """
+        scores = [c.true_processing_error(self.agents) for c in self.controllers]
+        rmse = float(np.mean([value[0] for value in scores]))
+        mape = float(np.mean([value[1] for value in scores]))
+        counts = np.zeros((len(self.controllers), len(DOMAIN_ORDER)), dtype=float)
+        for row in self.task_records:
+            counts[row["controller_id"], DOMAIN_INDEX[row["domain"]]] += 1.0
+        totals = counts.sum(axis=1, keepdims=True)
+        mixes = counts / np.maximum(totals, 1.0)
+        skew = 0.0
+        for left in range(len(self.controllers)):
+            for right in range(left + 1, len(self.controllers)):
+                skew = max(skew, 0.5 * float(np.abs(mixes[left] - mixes[right]).sum()))
+        return {
+            "true_processing_rmse": rmse,
+            "true_processing_mape": mape,
+            "domain_mix_total_variation": float(skew),
+        }
+
+    def _controller_for(self, task: ReplayTask) -> PaperController:
         if self.config.architecture in {"oracle", "centralized_exact"} or self.config.controllers == 1:
             return self.controllers[0]
-        controller = min(self.controllers, key=lambda c: (c.active_tasks, c.controller_id))
+        if self.config.controller_assignment == "domain":
+            # Disjoint domain ownership: the six domains are split as evenly as
+            # possible across the controllers, so each one observes only its
+            # own slice of the workload.
+            controller = self.controllers[
+                (task.domain * self.config.controllers) // len(DOMAIN_ORDER)
+            ]
+        else:
+            controller = min(self.controllers, key=lambda c: (c.active_tasks, c.controller_id))
         controller.active_tasks += 1
         return controller
 
@@ -534,7 +603,7 @@ class ControlledReplayExperiment:
         )
 
     def _submit(self, task: ReplayTask, now: float) -> None:
-        controller = self._controller_for()
+        controller = self._controller_for(task)
         if self.config.architecture in {"legacy_local_queue", "fixed_replay"}:
             proposals = [self._proposal(controller, task, agent, now) for agent in self.agents]
             if self.config.architecture == "fixed_replay":
@@ -749,6 +818,7 @@ class ControlledReplayExperiment:
             "max_utilization": float(utilization.max()), "jain_fairness": jain,
             "oracle_queries": float(self.optimizer.state.query_count),
             "infrastructure_units": float(self.config.agents + 0.25 * self.config.controllers),
+            **self._generalization_metrics(),
             **network_summary,
         }
 
