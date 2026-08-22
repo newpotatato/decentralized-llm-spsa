@@ -238,6 +238,7 @@ class AdaptiveController:
         
         self.lambda_forget = lambda_forget
         self.obs_history = deque(maxlen=50)  # Последние 50 наблюдений
+        self.quality_obs_history = deque(maxlen=50)
         self.meta_history = deque(maxlen=120)
         
         # Очередь задач для load balancing
@@ -296,6 +297,24 @@ class AdaptiveController:
         err = true_Q - np.dot(self.theta_quality, z)
         self.theta_quality += K * err
         self.P_quality = (self.P_quality - np.outer(K, z.T @ self.P_quality)) / self.lambda_forget
+        self.quality_obs_history.append((z.copy(), float(true_Q)))
+
+    def adapt_routing_weights(
+        self,
+        routing_features: np.ndarray,
+        observed_utility: float,
+        learning_rate: float = 0.05,
+    ):
+        """Update only this controller's routing weights from judge feedback."""
+        x = np.asarray(routing_features, dtype=float)
+        if x.shape != self.routing_weights.shape:
+            raise ValueError("routing feature dimension does not match weights")
+        prediction = float(np.dot(self.routing_weights, x))
+        error = float(observed_utility) - prediction
+        anchor = _default_routing_weights(float(self.routing_weights[5]))
+        updated = self.routing_weights + learning_rate * error * x
+        updated = 0.995 * updated + 0.005 * anchor
+        self.routing_weights = _normalize_routing_weights(updated, cost_enabled=True)
 
     def get_agent_rating(self, agent_id: int, task_type: int, prior: float) -> float:
         return float(self.agent_rating.get((agent_id, task_type), prior))

@@ -5,3 +5,4 @@ scipy>=1.13
 plotly>=5.0
 catboost>=1.2
 requests>=2.31
+datasets>=2.19

@@ -1,0 +1,42 @@
+{
+  "passed": true,
+  "failures": [],
+  "records": 1200,
+  "class_counts": {
+    "frontend": 200,
+    "backend_api": 200,
+    "databases_data_engineering": 200,
+    "ml_llm": 200,
+    "devops_cloud": 200,
+    "security": 200
+  },
+  "unique_fraction": 1.0,
+  "median_prompt_chars": {
+    "frontend": 599.0,
+    "backend_api": 636.0,
+    "databases_data_engineering": 716.0,
+    "ml_llm": 908.0,
+    "devops_cloud": 655.5,
+    "security": 1016.5
+  },
+  "median_length_ratio": 1.6969949916527547,
+  "task_kind_distribution": {
+    "question_answering": 0.3475,
+    "code_generation": 0.24333333333333335,
+    "design": 0.05583333333333333,
+    "code_editing": 0.05583333333333333,
+    "debugging": 0.2975
+  },
+  "task_kind_total_variation": {
+    "frontend": 0.1425,
+    "backend_api": 0.060000000000000026,
+    "databases_data_engineering": 0.18999999999999995,
+    "ml_llm": 0.09916666666666668,
+    "devops_cloud": 0.021666666666666674,
+    "security": 0.13416666666666666
+  },
+  "tag_purity": 1.0,
+  "source_count": 1,
+  "source_class_confounding": "controlled: one common source for every class",
+  "reference_answers_available": 0
+}

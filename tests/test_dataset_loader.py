@@ -2,9 +2,14 @@
 Tests verifying that generate_tasks() uses real dataset prompts, not templates,
 and that semantic features extracted from real texts are task-type-appropriate.
 
-Local datasets (MBPP, TriviaQA) are always tested.
-HuggingFace datasets (XSum, OPUS-100, Hermes-FC) are tested from the JSON
-cache in data/.hf_cache/ if it exists, skipped otherwise.
+This is the legacy five-task data path.  It is not used by the controlled
+six-domain IT protocol of the manuscript, which reads the pinned manifest in
+``data/it_routing_benchmark.jsonl`` instead.
+
+Every dataset here is optional and each test skips when its corpus is absent,
+so a missing local corpus reports as a skip rather than as a code failure.
+Nothing may silently pass instead: when a corpus *is* present the assertions
+run in full.
 """
 
 import sys
@@ -15,7 +20,34 @@ from pathlib import Path
 # Ensure src/ is importable when running as `python -m pytest` from repo root.
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.dataset_loader import get_task_pool, _POOL_CACHE, _HF_CACHE
+from src.dataset_loader import get_task_pool, _POOL_CACHE, _HF_CACHE, _DATA_ROOT
+
+_MBPP = _DATA_ROOT / "mbpp.jsonl"
+_TRIVIAQA = _DATA_ROOT / "triviaqa-unfiltered" / "unfiltered-web-dev.json"
+_TRIVIAQA_CACHE = _HF_CACHE / "triviaqa_questions.json"
+
+
+def _local(name: str) -> bool:
+    """Return True if the local corpus backing *name* is available."""
+    if name == "PROGRAMMING":
+        return _MBPP.exists()
+    if name == "QA":
+        return _TRIVIAQA.exists() or _TRIVIAQA_CACHE.exists()
+    return True
+
+
+requires_mbpp = unittest.skipUnless(
+    _local("PROGRAMMING"),
+    f"MBPP corpus is absent ({_MBPP}); fetch it with src.prepare_it_dataset",
+)
+requires_triviaqa = unittest.skipUnless(
+    _local("QA"),
+    f"TriviaQA corpus is absent ({_TRIVIAQA}); fetch it with src.prepare_it_dataset",
+)
+requires_local_corpora = unittest.skipUnless(
+    _local("PROGRAMMING") and _local("QA"),
+    "MBPP and TriviaQA corpora are absent; fetch them with src.prepare_it_dataset",
+)
 from src.main import SemanticFeatureExtractor, TaskType
 from src.run_spsa_comparison import generate_tasks, SCENARIO_TEMPLATES
 
@@ -48,11 +80,13 @@ class TestPoolBasics(unittest.TestCase):
                         f"{type_name} pool contains empty or non-string items.")
         return pool
 
+    @requires_mbpp
     def test_programming_pool_loads(self):
         pool = self._check_pool("PROGRAMMING", min_size=100)
         self.assertGreaterEqual(len(pool), 900,
                                 "MBPP should provide ~974 tasks; got fewer — file may be truncated.")
 
+    @requires_triviaqa
     def test_qa_pool_loads(self):
         pool = self._check_pool("QA", min_size=1000)
         self.assertGreaterEqual(len(pool), 5000,
@@ -77,6 +111,7 @@ class TestPoolContents(unittest.TestCase):
     def setUp(self):
         _POOL_CACHE.clear()
 
+    @requires_mbpp
     def test_programming_prompts_mention_code_concepts(self):
         pool = get_task_pool("PROGRAMMING")
         code_kws = {"function", "write", "python", "find", "list",
@@ -85,6 +120,7 @@ class TestPoolContents(unittest.TestCase):
         self.assertGreater(hits / len(pool), 0.80,
                            "Less than 80% of MBPP prompts mention coding concepts.")
 
+    @requires_triviaqa
     def test_qa_prompts_are_questions(self):
         pool = get_task_pool("QA")
         question_words = {"who", "what", "when", "where", "which",
@@ -143,9 +179,11 @@ class TestPoolDiversity(unittest.TestCase):
             f"{type_name} pool contains hardcoded template string(s): {overlap}",
         )
 
+    @requires_mbpp
     def test_programming_diversity(self):
         self._check_diversity("PROGRAMMING")
 
+    @requires_triviaqa
     def test_qa_diversity(self):
         self._check_diversity("QA")
 
@@ -230,6 +268,7 @@ class TestGenerateTasks(unittest.TestCase):
     def setUp(self):
         _POOL_CACHE.clear()
 
+    @requires_local_corpora
     def test_tasks_use_real_diverse_texts(self):
         tasks = generate_tasks(50, seed=42)
         texts = [t.text for t in tasks]

@@ -1,0 +1,444 @@
+% Working architecture notes for discussion.
+% This file is intentionally separate from the manuscript and is not included
+% by 0_MAIN.tex. Confirmed decisions, proposed additions, and open questions
+% are visually distinguished below.
+
+\documentclass[11pt]{article}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[english]{babel}
+\usepackage{amsmath,amssymb}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{xcolor}
+\usepackage{enumitem}
+
+\definecolor{confirmed}{RGB}{25,110,55}
+\definecolor{proposal}{RGB}{25,75,145}
+\definecolor{question}{RGB}{175,45,35}
+\definecolor{warning}{RGB}{155,90,0}
+
+\newcommand{\Confirmed}[1]{\par\noindent\textcolor{confirmed}{\textbf{CONFIRMED:} #1}\par}
+\newcommand{\Proposal}[1]{\par\noindent\textcolor{proposal}{\textbf{PROPOSED:} #1}\par}
+\newcommand{\Question}[1]{\par\noindent\textcolor{question}{\textbf{OPEN QUESTION:} #1}\par}
+\newcommand{\Warning}[1]{\par\noindent\textcolor{warning}{\textbf{LIMITATION:} #1}\par}
+\newcommand{\Resolved}[1]{\par\noindent\textcolor{confirmed}{\textbf{RESOLVED:} #1}\par}
+
+\title{Working Notes on the Global-Buffer A-SPSA Architecture}
+\author{Architecture review draft}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Scope and implementation status}
+
+\Confirmed{The legacy \texttt{ExactOrchestrator} remains available as a
+baseline. New experiments use the global-buffer architecture.}
+
+\Confirmed{The current work covers the architectural refactoring, paper loss
+functions, replay oracle, exact matching, tests, and documentation. Real-LLM
+runs and final figures are outside the current scope.}
+
+\Confirmed{The code may be split into new modules and the result schema may be
+versioned. Compatibility wrappers should preserve old entry points where
+practical.}
+
+\section{Task time model}
+
+\Confirmed{The experiment uses an external deadline $D_i$. It must be generated
+independently of the routing algorithm and remain identical for every method
+compared on the same task stream.}
+
+\Confirmed{The observed waiting target $w_i^{\mathrm{real}}$ is the actual time
+between task arrival and execution start:}
+\begin{equation}
+ w_i^{\mathrm{real}}=t_i^{\mathrm{start}}-t_i^{\mathrm{arr}}.
+\end{equation}
+The controller prediction is denoted by $\widehat w_i$. These quantities must
+not be interpreted as an externally specified admissible waiting budget.
+
+\Proposal{Use a separate external deadline budget $b_i=D_i-t_i^{\mathrm{arr}}$.
+This prevents the waiting predictor from defining the metric by which it is
+evaluated.}
+
+\Question{How should the external deadline be generated: from a fixed
+task-level service-level objective, from a frozen oracle quantile, or from an
+explicit scenario distribution? This decision remains intentionally open until
+the workload data and the accompanying recommendation are provided.}
+
+\section{Pair-level processing prediction}
+
+\Confirmed{Processing time is predicted for every task--agent pair:}
+\begin{equation}
+ \widehat p_{ik}=(x_{ik}^{(p)})^\top\theta_j^{(p)}.
+\end{equation}
+
+\Proposal{The feature vector $x_{ik}^{(p)}$ should contain separate task-type
+coordinates, task complexity and size, agent identity/profile, and semantic
+relevance. No coordinate may simultaneously encode the \texttt{TOOL\_USE}
+class and an aggregate semantic feature.}
+
+\section{Prediction objectives}
+
+\Confirmed{A-SPSA uses the loss functions stated in the manuscript. Local RLS
+remains a fast quadratic estimator; its local update objective is explicitly
+distinguished from the A-SPSA synchronization objective.}
+
+\subsection{Processing-time loss}
+
+\begin{equation}
+p_{i,k_i}^{\mathrm{corr}}=
+\frac{p_{i,k_i}^{\mathrm{real}}}
+{1+a_R^{(p)}(1-R_{i,k_i})},
+\end{equation}
+\begin{equation}
+f_{j,i}^{(p)}(\theta)=
+\delta_p^2\left[
+\sqrt{1+\left(
+\frac{\widehat p_{j,i}-p_{i,k_i}^{\mathrm{corr}}}
+{\delta_p\left(\varepsilon_p+p_{i,k_i}^{\mathrm{corr}}
+\left(1+a_h^{(p)}h_i/h_{\max}\right)\right)}
+\right)^2}-1\right]
++\frac{\lambda_{\mathrm{reg}}^{(p)}}2\lVert\theta\rVert^2.
+\end{equation}
+
+\subsection{Waiting-time loss}
+
+\begin{equation}
+f_{j,i}^{(w)}(\theta)=
+a_w^-\max\{w_i^{\mathrm{real}}-\widehat w_i,0\}^2+
+a_w^+\max\{\widehat w_i-w_i^{\mathrm{real}},0\}^2,
+\qquad a_w^->a_w^+>0.
+\end{equation}
+
+\subsection{Response-quality loss}
+
+\begin{equation}
+f_{j,i}^{(q)}(\theta)=
+\left(1+a_h^{(q)}\frac{h_i}{h_{\max}}\right)
+(\widehat q_{j,ik_i}-q_{i,k_i}^{\mathrm{real}})^2+
+a_R^{(q)}R_{i,k_i}
+\max\{\widehat q_{j,ik_i}-q_{i,k_i}^{\mathrm{real}},0\}^2.
+\end{equation}
+
+\Proposal{Place every loss coefficient in a typed experiment configuration.
+Select coefficients only on a dedicated validation stream whose seed and tasks
+are disjoint from evaluation streams. Store the selected configuration in each
+result artifact.}
+
+\Question{Should the first implementation use documented neutral defaults and
+then tune them on validation, or should implementation wait for manually fixed
+coefficient values?}
+
+\section{Replay protocol}
+
+\Confirmed{For every $(T_i,E_k,\mathrm{seed})$, the replay oracle fixes the
+potential processing time, quality, success, and cost. Every compared routing
+method receives the same task stream and potential-outcome table.}
+
+\Proposal{A controller observes feedback only for the selected agent. Outcomes
+of unselected pairs remain hidden and are used only to ensure fair replay.}
+
+\section{Assignment}
+
+\Confirmed{Exact maximum-weight bipartite matching is the primary dispatch
+strategy. Deterministic greedy matching remains available as a baseline and
+ablation.}
+
+\Proposal{Use a deterministic tie-breaking perturbation or a documented
+secondary ordering so exact matching remains reproducible.}
+
+\section{Exploration and partial feedback}
+
+Only the selected task--agent pair produces observable feedback. Consequently,
+an initially underestimated agent may never be selected and its estimate may
+never improve.
+
+\Confirmed{Exploration is disabled in the current architecture and in the main
+paper configuration. It must not affect present routing decisions.}
+
+\Proposal{Retain exploration only as a future scenario or ablation. A future
+implementation may record observation counts and uncertainty and compare an
+optional UCB-style policy against the non-exploratory main configuration.}
+
+\section{Data and failure policy}
+
+\Confirmed{The intended experiment environment contains the required datasets;
+the missing-dataset scenario is not part of the target workflow.}
+
+\Proposal{Nevertheless, paper mode should validate all required inputs before
+starting and fail with a clear message instead of silently substituting a
+single fallback prompt. This is a guard against accidentally producing invalid
+paper artifacts.}
+
+% Added after the controlled IT benchmark audit.
+\section{Controlled IT benchmark}
+
+\Confirmed{The primary routing workload uses a single pinned Stack Overflow
+source for all six IT domains.  Domain labels are derived only from explicit
+question tags.  A source question may occur in at most one primary class, while
+its full multi-domain tag vector is retained.}
+
+\Confirmed{The paper-scale default is currently 200 questions per domain
+(1,200 total), because Security and ML/LLM are the limiting conservative tag
+pools.  Increasing a nominal target by duplication or weaker tags is forbidden.}
+
+\Confirmed{For revision \texttt{18c9ddf} and seed 42, the construction audit
+reports equal class counts, 100\% normalized-prompt uniqueness, 100\% explicit
+tag purity, median-length ratio 1.697, and maximum task-kind total variation
+0.190.}
+
+\Warning{The primary source contains no reference answers in the selected
+configuration.  It supports routing, queueing, matching, and replay experiments,
+but it does not independently support claims about LLM answer correctness.}
+
+\Warning{Task-kind and difficulty fields are heuristic stratification
+covariates, not human-validated labels.  Stack Overflow tags are domain proxies,
+not a proof that a task requires only one skill.}
+
+\Confirmed{Heterogeneous sources such as DS-1000, SQL Create Context, Glaive,
+DevOps QA, and Trendyol Cybersecurity are retained only as separate
+external-validity tests.  They must not be pooled to estimate primary routing
+performance because dataset source would reveal the class.}
+
+\Warning{The earlier Vulcan frontend candidate is rejected: empirical
+inspection found only 14 unique prompts among thousands of rows, dominated by
+output-style variants.}
+
+\Question{Which grouped split proportions and number of independent replay
+seeds will be fixed before the first real experiment?  Proposed default:
+60/20/20 by Stack Overflow question ID and at least 10 paired replay seeds.}
+
+\Question{How will the real agent-by-domain capability matrix be calibrated on
+a disjoint subset?  Until this is measured, all agent specialization claims
+must explicitly be called simulated.}
+\section{Paper-facing experiment protocol}
+
+\Confirmed{All searched and evaluated systems contain at least three agents
+and three controllers. Centralized and oracle baselines retain three physical
+controllers but use one logical decision authority.}
+
+\Confirmed{Optimizer comparison is separated from routing. It uses an
+exogenous balanced assignment, identical observed feedback for all methods,
+and $H_{\mathrm{sync}}=5$. Architecture comparison retains the event-driven
+global buffer.}
+
+\Confirmed{The three primary optimizer endpoints are the separate network
+objectives
+\begin{equation}
+\Phi_{\nu}=\sum_j F_j^{(\nu)}(\theta_j)
+ +\frac{\omega_{\nu}}{4}\sum_j\sum_l b_{jl}
+ \lVert\theta_j-\theta_l\rVert^2,
+ \qquad \nu\in\{p,w,q\},
+\end{equation}
+with $\omega_p=\omega_w=\omega_q=0.05$. Routing utility is a secondary
+diagnostic and is not used for optimizer tuning or selection.}
+
+\Confirmed{Processing, waiting, and quality hyperparameters are tuned
+independently on validation with equal six-configuration budgets for every
+method. The network coefficient is fixed across methods. Objective-query counts
+are recorded; coordinate-wise KW is charged $2d$ queries.}
+
+\Confirmed{The A-SPSA recurrence uses $\gamma_{\tau-1}$ in the equation for
+$\alpha_\tau$, a fixed descent parameter $h$, and a decaying perturbation
+$\beta_\tau$. The fixed-beta ablation fixes $\beta$, not $\alpha$.}
+
+\Warning{The manuscript does not specify $\alpha_0$. The reproducible neutral
+choice $\alpha_0=0$ is therefore recorded in every selected optimizer
+configuration and must be disclosed as an implementation choice.}
+
+\Confirmed{Architecture candidates are shortlisted on train and selected on
+validation without an arbitrary utility scalar. Feasibility requires deadline
+hit rate at least 0.80; candidates within 0.01 of the best validation quality
+are ordered by infrastructure size, deadline hit rate, p95 wait, and cost.}
+
+\Confirmed{Final test comparisons use ten paired replay seeds. Paired
+Wilcoxon tests receive Holm correction within each prespecified endpoint.
+Reports include relative paired effects and a descriptive one-percent
+practical-effect flag.}
+
+\Confirmed{The full bounded search covers 3--7 controllers, 3--12 agents, and
+synchronization intervals 5, 10, and 20. The selected 3-controller, 12-agent,
+interval-10 system is described only as best within this finite budget.}
+
+\Confirmed{A separate burst stress scenario uses six-task batches at
+$\rho=2.0$ while preserving mean offered load. Exact and greedy matching are
+not interpreted only from the continuous-arrival regime, where dispatch often
+reduces to a one-pair decision.}
+
+\Warning{The processing and quality blocks carry $9$ parameters per agent
+while the local rolling history contains at most $100$ selected observations,
+of which each controller sees roughly $80$. Local controllers need not share a
+common minimizer and online RLS makes the objective nonstationary. These
+conditions weaken the assumptions normally used to justify acceleration.}
+
+\Warning{Until real LLM calibration is performed, the capability matrix and
+all potential outcomes are simulated. Current figures validate the protocol
+and expose negative results; they do not establish real-model superiority.}
+
+\section{Fairness audit of the optimizer comparison}
+
+An audit of the earlier artifacts found that the primary endpoint was not
+measuring what the protocol claimed. The findings and their resolutions are
+recorded here because they change how every earlier number must be read.
+
+\Warning{The reported ranking on $\Phi_p$ was the exact inverse of the ranking
+on prediction accuracy. Decomposing the published artifacts gives local
+processing loss $0.0236$ for local RLS with no optimizer at all, $0.0637$ for
+the six baselines, and $0.0808$ for A-SPSA, while $\Phi_p$ orders them
+$1.936$, $0.675$, $0.081$. With $\omega=0.05$ and disagreement values of
+$12$--$38$ the penalty term reached $0.6$--$1.9$ against a local objective of
+$0.02$--$0.18$: the regularizer was one to two orders of magnitude larger than
+the quantity it regularized, so $\Phi$ was minimized by parameter
+homogenization rather than by accuracy.}
+
+\Resolved{$\omega$ is calibrated to $0.002$, and \texttt{local\_*} and
+\texttt{disagreement\_*} are prespecified primary endpoints alongside
+\texttt{phi\_*}. A method can win $\Phi$ and still be published as less
+accurate.}
+
+\Warning{The consensus mechanisms were not comparable. The baselines were
+mixed towards the ring average by a step-independent $5\%$, while A-SPSA
+received an additive $\omega(\tilde\theta_j-\bar\theta)$ scaled by $h$, giving
+a realized strength $\omega h = 0.05 \times 12 = 0.6$. Equalizing that one
+quantity on the published test seeds closes about $91\%$ of the reported
+$\Phi_p$ gap ($0.754 \to 0.124$ against A-SPSA's $0.084$); scaling A-SPSA's
+$\omega$ so that $\omega h = 0.05$ instead moves it to $0.572$, behind SPSA.
+Under equalized consensus SPSA and KW become numerically indistinguishable,
+which shows the endpoint had stopped separating the optimizers at all.}
+
+\Resolved{Every method now adds the identical correction
+$\omega\sum_\ell b_{j\ell}(\theta_j-\theta_\ell)$, the exact gradient of the
+disagreement term of $\Phi$, so the realized strength is $\omega h$ for all of
+them. Pinned by \texttt{tests/test\_protocol\_fairness.py}.}
+
+\Warning{The step grids were not comparable. A-SPSA received
+$h\in\{5,8,12,12,16,20\}$ on the processing block while the baselines received
+$h\in\{0.01,0.03,0.05\}$ and SP-GT $h\in\{0.0002,0.0005,0.001\}$. The
+justification was that the manuscript draws $\Delta\in\{\pm 1/\sqrt d\}^d$
+without a compensating factor $d$ --- but the SPSA baseline was implemented
+with $\Delta\in\{\pm 1\}$, so the two estimators differed in scale by
+$d=108$ and no single grid could serve both.}
+
+\Resolved{The manuscript perturbation points are retained and the estimate is
+compensated by $d$, so a step size means the same displacement for every
+method. One shared six-configuration grid spanning four decades is used, wide
+enough to contain each method's optimum: the methods genuinely do not share a
+usable step region. On a quadratic with $M=2$ the two-point estimators improve
+up to the theoretical $h=1/M$, A-SPSA is best near $10^{-3}$ and diverges
+above $5\cdot 10^{-2}$, and single-point SP-GT survives only at $10^{-4}$.}
+
+\Warning{The parameter prescription of the manuscript was never evaluated. For
+the paper loss configuration $M_p=X^2/\varepsilon_p^2=400$, so the prescribed
+step is $h=1/\max\{M_p,\omega\lambda_{\max}\}=0.0025$; the previous run
+selected $h=12$, about $4800$ times that bound.}
+
+\Resolved{\texttt{theory\_parameters} computes $\mu=\omega\lambda_2(L_{av})$,
+$h$, and the bound $0<\eta<\mu$ from the verified Lipschitz constants, and
+\texttt{experiment\_manifest.json} records them under \texttt{theory\_check}.
+$\mu-\eta$ is derived from $\omega\lambda_2$ rather than tuned.}
+
+\Warning{The zeroth-order methods received fewer objective evaluations than
+the blocks have parameters. A paper-scale run completes $43$ synchronization
+rounds, i.e.\ $86$ queries per controller per block against $108$ processing
+parameters, and each controller observes a median of one sample per
+(agent, domain) cell with $67$ of $216$ cells never observed. A ranking
+obtained in that regime reflects the deterministic parts of each recurrence,
+not gradient information.}
+
+\Resolved{Every summary reports \texttt{sync\_rounds},
+\texttt{tuned\_parameters}, \texttt{queries\_per\_parameter} and
+\texttt{query\_budget\_sufficient}, so the regime is visible in every table.
+The shortfall itself is a budget limitation of the pinned 1{,}200-question
+benchmark at a 60/20/20 split and remains a stated limitation, not a fixed
+defect.}
+
+\Warning{One feature coordinate was structurally unidentifiable. The queue
+occupancy feature read the global buffer, which \texttt{fixed\_replay} and
+\texttt{legacy\_local\_queue} bypass, so it was identically zero: the feature
+matrix had rank $8$ of $9$, leaving one parameter per agent per block
+unconstrained while every zeroth-order method kept perturbing it.}
+
+\Resolved{Queue occupancy is computed from tasks accepted but not yet started
+under every architecture. The full-rank property is pinned by a test.}
+
+\Warning{The waiting model influenced nothing. \texttt{predicted\_wait\_budget}
+was published into each proposal and read by no consumer: the external deadline
+and the time budget are exogenous, so $\Phi_w$ was a primary endpoint whose
+improvement could not change any operational outcome, and the manuscript
+motivation for F2 --- that underprediction narrows the internal deadline and
+lowers the Deadline Hit Rate --- was not true of the implemented system.}
+
+\Resolved{A task-level waiting-pressure term $\min(\text{elapsed}/\hat w_i,
+\text{cap})$ enters the buffer priority. It never defines $D_i$ or $b_i$, so
+the predictor still cannot define the metric it is scored on, but improving it
+now changes dispatch order.}
+
+\Question{The manuscript calls $\theta^{(w)}$ the acceptable waiting time
+while the implementation regresses the realized wait
+$t^{\mathrm{start}}_i-t^{\mathrm{arr}}_i$. These are different quantities. The
+manuscript text needs to be reconciled with the implemented target before
+submission.}
+
+\Warning{The availability term of the published priority formula was a no-op.
+Dispatch considers only agents with $\hat t_k^{avail}\le t$, for which
+$\mathrm{availability}_{ik}(t)=\exp(0)=1$, so $\lambda_A$ added the same
+constant to every candidate edge and could never change a matching.}
+
+\Resolved{The term is removed from the priority and retained as an audit
+field; \texttt{ARCHITECTURE.md} now matches what drives decisions. Task
+hotness additionally uses the best slack among agents the dispatch round can
+actually reach, instead of over all agents including occupied ones.}
+
+\Warning{Every significant result sits on the resolution floor of the test.
+With ten paired seeds the smallest attainable two-sided signed-rank $p$ is
+$2/2^{10}$, giving $p_{\mathrm{Holm}}=0.0117$ for six comparisons. The earlier
+ablation table reported that value as significant for relative effects of
+$4.5\cdot 10^{-8}$.}
+
+\Resolved{Each significance row now reports \texttt{effective\_pairs},
+\texttt{p\_resolution\_floor} and \texttt{p\_at\_resolution\_floor}; ties
+discarded by the test are accounted for in the floor.}
+
+\Warning{The selected configuration sat on the boundary of its own search
+grid at twelve agents.}
+
+\Resolved{The grid extends to $18$ agents with a distinct third agent tier, so
+a selection has headroom above it.}
+
+\Warning{Offered load is normalized against a canonical six-agent capacity, so
+a twelve-agent system at $\rho=0.85$ runs near $0.43$ utilization. The
+headline architecture table was therefore taken in a regime with almost no
+queueing, which is also why greedy and exact matching coincide there.}
+
+\Resolved{Every summary reports \texttt{rho\_effective} alongside
+\texttt{mean\_utilization}, so a load level cannot be read as a utilization.}
+
+\Warning{The generative model is exactly linear in the controller features,
+with i.i.d.\ noise, so the prediction problem has no misspecification. This is
+a deliberate property of a controlled replay and it bounds what the optimizer
+comparison can claim; it is documented rather than changed, because altering
+the oracle would invalidate every existing comparison.}
+
+\Warning{Two divergent implementations of the same algorithm coexist.
+\texttt{src/spsa\_variants.py} optimizes plain MSE and a one-sided hinge rather
+than F1/F2/F3, uses $\Delta\in\{\pm 1\}$, $\gamma_0=\mu+h$, $\alpha_0=0.5$ and
+$\varepsilon=0$, draws from the global NumPy RNG, and keeps its own parameter
+copy so RLS updates between rounds are discarded. It backs the entry points the
+README previously advertised as Table~1 and Table~2.}
+
+\Resolved{The README states that only \texttt{src.run\_paper\_experiments}
+produces paper evidence and that numbers from the two paths must not be mixed.}
+
+\section{Provenance}
+
+\Warning{The entire implementation was uncommitted when the earlier artifacts
+were produced, and two runs made with different tuning code could not be
+distinguished from the repository.}
+
+\Resolved{\texttt{experiment\_manifest.json} records
+\texttt{code\_revision}, the run directories are ignored by git, and the pinned
+routing manifest is versioned so the protocol is reproducible from the
+repository alone.}
+
+\end{document}

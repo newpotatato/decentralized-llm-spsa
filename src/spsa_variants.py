@@ -108,6 +108,17 @@ def _wait_loss(theta: np.ndarray, obs, delta: float = 0.1) -> float:
     return float(np.mean(errs)) if errs else 0.0
 
 
+def _quality_loss(theta: np.ndarray, obs) -> float:
+    """Rolling response-quality MSE used by A-SPSA."""
+    if not obs:
+        return 0.0
+    errs = []
+    for features, true_quality in list(obs)[-25:]:
+        pred = float(np.clip(np.dot(theta, features), 0.0, 1.0))
+        errs.append((pred - float(true_quality)) ** 2)
+    return float(np.mean(errs)) if errs else 0.0
+
+
 def _comm_graph(step: int, n: int) -> np.ndarray:
     """Случайный временной граф (Poisson-степень, макс. 2 соседа)."""
     B = np.zeros((n, n))
@@ -215,7 +226,7 @@ def _aspsa_step(
     # r = α_k · γ_{k-1} / γ_k  (weight for surrogate center in probing point)
     r = alpha_k * kappa_prev / kappa_k
 
-    new_t, new_w = [], []
+    new_t, new_w, new_q = [], [], []
     for j, ctrl in enumerate(controllers):
         cid = ctrl.id
         dim = len(ctrl.theta_time)
@@ -223,6 +234,7 @@ def _aspsa_step(
         if len(ctrl.obs_history) < 10:
             new_t.append(ctrl.theta_time.copy())
             new_w.append(ctrl.theta_wait.copy())
+            new_q.append(ctrl.theta_quality.copy())
             continue
 
         if cid not in S:
@@ -231,18 +243,26 @@ def _aspsa_step(
                 "theta_bar_w": ctrl.theta_wait.copy(),
                 "z_bar_t":     np.zeros(dim),
                 "z_bar_w":     np.zeros(dim),
+                "theta_bar_q": ctrl.theta_quality.copy(),
+                "z_bar_q":     np.zeros(len(ctrl.theta_quality)),
             }
+
+        S[cid].setdefault("theta_bar_q", ctrl.theta_quality.copy())
+        S[cid].setdefault("z_bar_q", np.zeros(len(ctrl.theta_quality)))
 
         tb_t = S[cid]["theta_bar_t"]
         tb_w = S[cid]["theta_bar_w"]
         zb_t = S[cid]["z_bar_t"]
         zb_w = S[cid]["z_bar_w"]
+        tb_q = S[cid]["theta_bar_q"]
+        zb_q = S[cid]["z_bar_q"]
 
         # Probing point per paper Eq (12):
         # x̃_k = (α_k·γ_{k-1}·z̄ + γ_k·θ̄) / (γ_{k-1} + α_k·(μ-η))
         denom = kappa_prev + alpha_k * mu_eta   # γ_{k-1} + α_k·(μ-η)
         xt_t  = (alpha_k * kappa_prev * zb_t + kappa_k * tb_t) / denom
         xt_w  = (alpha_k * kappa_prev * zb_w + kappa_k * tb_w) / denom
+        xt_q  = (alpha_k * kappa_prev * zb_q + kappa_k * tb_q) / denom
 
         # SPSA gradient estimate at x̃ — shared perturbation direction for F1 and F2
         d = 2 * np.random.randint(0, 2, dim) - 1   # one Rademacher draw, used for both
@@ -250,29 +270,39 @@ def _aspsa_step(
                _proc_loss(xt_t - pert * d, ctrl.obs_history)) / (2 * pert * d)
         g_w = (_wait_loss(xt_w + pert * d, ctrl.obs_history) -
                _wait_loss(xt_w - pert * d, ctrl.obs_history)) / (2 * pert * d)
+        d_q = 2 * np.random.randint(0, 2, len(ctrl.theta_quality)) - 1
+        quality_obs = getattr(ctrl, "quality_obs_history", ())
+        g_q = (_quality_loss(xt_q + pert * d_q, quality_obs) -
+               _quality_loss(xt_q - pert * d_q, quality_obs)) / (2 * pert * d_q)
 
         # Consensus at probing point
         nbrs = np.where(B[j] > 0)[0]
         if len(nbrs):
             g_t += gamma * sum(B[j, jp] * (xt_t - controllers[jp].theta_time) for jp in nbrs)
             g_w += gamma * sum(B[j, jp] * (xt_w - controllers[jp].theta_wait) for jp in nbrs)
+            g_q += gamma * sum(B[j, jp] * (xt_q - controllers[jp].theta_quality) for jp in nbrs)
 
         # θ̄_{k} = x̃_k − h · ḡ_k
         new_tb_t = xt_t - h * g_t
         new_tb_w = xt_w - h * g_w
+        new_tb_q = xt_q - h * g_q
 
         # z̄_k = (1/γ_k)·[(1-α_k)·γ_{k-1}·z̄_{k-1} + α_k·(µ-η)·x̃_k − α_k·ḡ_k]
         coeff = 1.0 / kappa_k
         new_zb_t = coeff * ((1-alpha_k)*kappa_prev*zb_t + alpha_k*mu_eta*xt_t - alpha_k*g_t)
         new_zb_w = coeff * ((1-alpha_k)*kappa_prev*zb_w + alpha_k*mu_eta*xt_w - alpha_k*g_w)
+        new_zb_q = coeff * ((1-alpha_k)*kappa_prev*zb_q + alpha_k*mu_eta*xt_q - alpha_k*g_q)
 
         S[cid]["theta_bar_t"] = new_tb_t
         S[cid]["theta_bar_w"] = new_tb_w
         S[cid]["z_bar_t"]     = new_zb_t
         S[cid]["z_bar_w"]     = new_zb_w
+        S[cid]["theta_bar_q"] = new_tb_q
+        S[cid]["z_bar_q"]     = new_zb_q
 
         new_t.append(new_tb_t)
         new_w.append(new_tb_w)
+        new_q.append(new_tb_q)
 
     alg["kappa"]      = kappa_k
     alg["prev_alpha"] = alpha_k
@@ -287,9 +317,10 @@ def _aspsa_step(
             "alpha_k": float(alpha_k), "kappa_k": float(kappa_k), "pert": float(pert),
         })
 
-    for ctrl, t, w in zip(controllers, new_t, new_w):
+    for ctrl, t, w, q in zip(controllers, new_t, new_w, new_q):
         ctrl.theta_time = _clip_t(t)
         ctrl.theta_wait = _clip_w(w)
+        ctrl.theta_quality = np.clip(q, -2.0, 2.0)
 
 
 def aspsa_consensus(
