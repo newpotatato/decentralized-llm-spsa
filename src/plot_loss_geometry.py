@@ -134,14 +134,43 @@ def panel_c(ax, manifest: Path) -> None:
     ax.axhline(0.0, color="0.6", lw=0.8)
 
 
+def plain_figure(cfg: PaperLossConfig, output: Path) -> None:
+    """The three losses, same axes, nothing else."""
+    errors = np.linspace(-1.5, 1.5, 600)
+    o = _obs()
+    target_p = o.processing_real / (1.0 + cfg.a_relevance_p * (1.0 - o.relevance))
+    curves = (
+        ("$F_1$", C_P, [processing_loss(target_p + e, o, cfg) for e in errors]),
+        ("$F_2$", C_W, [waiting_loss(o.waiting_real + e, o, cfg) for e in errors]),
+        ("$F_3$", C_Q, [quality_loss(o.quality_real + e, o, cfg) for e in errors]),
+    )
+    top = max(max(y) for _, _, y in curves)
+    fig, axes = plt.subplots(1, 3, figsize=(13.5, 4.0), sharey=True)
+    for ax, (name, colour, y) in zip(axes, curves):
+        ax.plot(errors, y, color=colour, lw=2.6)
+        ax.set_title(name, fontsize=15)
+        ax.set_xlabel("prediction error")
+        ax.set_ylim(-0.05 * top, top * 1.05)
+        ax.grid(alpha=0.25)
+    axes[0].set_ylabel("loss")
+    fig.tight_layout()
+    fig.savefig(output, dpi=220, bbox_inches="tight")
+    print(f"written {output}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path,
                         default=Path("data/it_routing_benchmark.jsonl"))
     parser.add_argument("--output", type=Path, default=Path("loss_geometry.png"))
+    parser.add_argument("--plain", action="store_true",
+                        help="just the three losses on shared axes, no annotation")
     args = parser.parse_args()
 
     cfg = PaperLossConfig()
+    if args.plain:
+        plain_figure(cfg, args.output)
+        return
     fig, axes = plt.subplots(1, 3, figsize=(17.5, 5.2))
     panel_a(axes[0], cfg)
     panel_b(axes[1], cfg)

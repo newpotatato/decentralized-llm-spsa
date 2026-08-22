@@ -138,6 +138,18 @@ class ExperimentConfig:
     #              controller never observes the domains it does not route, so
     #              those parameters can only improve through its neighbours.
     controller_assignment: str = "load"
+    # Adapt-then-combine synchronisation.  After the local update, each
+    # controller replaces its parameters by a convex combination with its ring
+    # neighbours:  theta_j <- (1 - 2*eps) theta_j + eps theta_{j-1} + eps
+    # theta_{j+1}.  This is the diffusion strategy of the distributed-estimation
+    # literature, as opposed to the manuscript's consensus strategy, which adds
+    # omega * sum_l b_jl (theta_j - theta_l) inside the descent step.
+    #
+    # The two differ by orders of magnitude in how much a neighbour matters: the
+    # consensus term is scaled by the descent step, giving a realised strength
+    # of omega*h ~ 1e-4 here, while the combination acts at the scale of the
+    # estimate itself.  0 disables it; 1/(controllers) is full averaging.
+    diffusion_mixing: float = 0.0
     # The manuscript's verification of Assumption 4 sets X_max = Z_max = 1 and
     # derives M_p = X^2/eps_p^2 = 400 from it.  The raw feature vector has
     # ||x|| up to 2, so every constant it states is understated by X_max^2 and
@@ -183,6 +195,8 @@ class ExperimentConfig:
             raise ValueError("network_omega must contain three non-negative coefficients")
         if self.controller_assignment not in {"load", "domain"}:
             raise ValueError("controller_assignment must be load or domain")
+        if not 0.0 <= self.diffusion_mixing <= 0.5:
+            raise ValueError("diffusion_mixing must lie in [0, 0.5]")
         if self.architecture not in {
             "legacy_local_queue", "random", "static_skill", "shortest_queue",
             "global_greedy", "global_exact", "centralized_exact", "oracle",
@@ -858,6 +872,7 @@ class ControlledReplayExperiment:
                     "oracle_queries": 0.0,
                     "oracle_queries_cumulative": float(self.optimizer.state.query_count),
                 }
+            self._combine_controllers()
             losses = np.asarray([c.current_losses() for c in self.controllers], dtype=float)
             network = self._network_objectives()
             self.round_records.append({
@@ -866,6 +881,24 @@ class ControlledReplayExperiment:
                 "f2": float(losses[:, 1].mean()), "f3": float(losses[:, 2].mean()),
                 **network, **trace,
             })
+    def _combine_controllers(self) -> None:
+        """Adapt-then-combine: average each controller with its ring neighbours.
+
+        Runs after the local update, so it is the combine half of ATC.  It costs
+        no objective evaluations - only one parameter exchange per neighbour,
+        the same message the consensus term already needs.
+        """
+        epsilon = float(self.config.diffusion_mixing)
+        count = len(self.controllers)
+        if epsilon <= 0.0 or count < 2:
+            return
+        vectors = [controller.pack_parameters() for controller in self.controllers]
+        for index, controller in enumerate(self.controllers):
+            left = vectors[(index - 1) % count]
+            right = vectors[(index + 1) % count]
+            mixed = (1.0 - 2.0 * epsilon) * vectors[index] + epsilon * (left + right)
+            controller.unpack_parameters(mixed)
+
     def _snapshot_load(self, now: float) -> None:
         pending = self._pending_count(now)
         row = {"event_time": now, "pending_tasks": pending}

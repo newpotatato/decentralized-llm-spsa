@@ -678,6 +678,7 @@ def run_suite(args):
         task_limit=limit,
         seed=seeds[0],
         network_omega=(NETWORK_OMEGA, NETWORK_OMEGA, NETWORK_OMEGA),
+        diffusion_mixing=float(getattr(args, "diffusion_mixing", 0.0)),
     )
     initial_tuning = _tune_methods(args.manifest, output, base, ("aspsa",), args.profile, "initial_aspsa")
     base = replace(base, optimizer_configs=initial_tuning["aspsa"])
@@ -825,6 +826,7 @@ def run_suite(args):
         "selected_optimizer_parameters": {name: asdict(cfg) for name, cfg in tuned.items()},
         "selection_rule": "bounded grid; DHR>=0.80; within 0.01 of best validation quality choose smallest infrastructure, then DHR, p95 wait, and cost; routing utility excluded",
         "replay": "fixed potential outcomes per (task_id, agent_id, seed); selected-pair feedback only",
+        "diffusion_mixing": float(getattr(args, "diffusion_mixing", 0.0)),
     }
     (output / "experiment_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
@@ -834,6 +836,9 @@ def parse_args():
     parser.add_argument("--manifest", type=Path, default=Path("data/it_routing_benchmark.jsonl"))
     parser.add_argument("--output-dir", type=Path, default=Path("paper_experiment_outputs"))
     parser.add_argument("--profile", choices=("pilot", "full"), default="pilot")
+    parser.add_argument("--diffusion-mixing", type=float, default=0.0,
+                        help="adapt-then-combine strength; 0 keeps the manuscript's "
+                             "consensus-only synchronisation")
     return parser.parse_args()
 
 
