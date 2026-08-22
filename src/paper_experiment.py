@@ -690,16 +690,34 @@ class ControlledReplayExperiment:
                 f"disagreement_{short_name}_final": float(disagreement[-1]) if len(disagreement) else np.nan,
             })
         blocks = dict(self.controllers[0].parameter_blocks())
-        active_dimension = sum(
-            blocks[name].stop - blocks[name].start
-            for name in self.config.optimizer_blocks
-        )
+        active = [name for name in self.config.optimizer_blocks]
+        dimensions = {
+            name: blocks[name].stop - blocks[name].start for name in active
+        }
+        active_dimension = sum(dimensions.values())
         tuned_parameters = float(active_dimension * self.config.controllers)
         queries = float(self.optimizer.state.query_count)
         # A two-point zeroth-order method cannot resolve a block whose
-        # dimension exceeds its query budget.  This ratio is reported so a
+        # dimension exceeds its query budget.  These ratios are reported so a
         # comparison run below one cannot be read as an optimizer ranking.
+        #
+        # The ratio is reported per block as well.  Every block receives the
+        # same number of evaluations per round irrespective of its dimension,
+        # while the blocks differ in size by an order of magnitude, so the
+        # pooled ratio can look sufficient while the two large blocks are not.
+        # The binding constraint is the worst block, which is what
+        # query_budget_sufficient tests.
         queries_per_parameter = queries / max(tuned_parameters, 1.0)
+        block_queries: dict[str, float] = {name: 0.0 for name in active}
+        for record in self.round_records:
+            for name in active:
+                block_queries[name] += float(record.get(f"oracle_queries_{name}", 0.0))
+        block_ratios = {
+            name: block_queries[name]
+            / max(float(dimensions[name] * self.config.controllers), 1.0)
+            for name in active
+        }
+        worst_block_ratio = min(block_ratios.values()) if block_ratios else 0.0
         actual_capacity = pool_capacity(self.agents)
         canonical_capacity = pool_capacity(make_agent_pool(CANONICAL_AGENTS))
         rho_effective = float(self.config.rho) * canonical_capacity / max(actual_capacity, 1e-12)
@@ -710,7 +728,12 @@ class ControlledReplayExperiment:
             "sync_rounds": float(len(self.round_records)),
             "tuned_parameters": tuned_parameters,
             "queries_per_parameter": float(queries_per_parameter),
-            "query_budget_sufficient": float(queries_per_parameter >= 1.0),
+            "worst_block_queries_per_parameter": float(worst_block_ratio),
+            "query_budget_sufficient": float(worst_block_ratio >= 1.0),
+            **{
+                f"queries_per_parameter_{name}": float(value)
+                for name, value in block_ratios.items()
+            },
             "success_rate": float(values("success").mean()),
             "mean_quality": float(values("quality_real").mean()),
             "deadline_hit_rate": float(values("deadline_hit").mean()),

@@ -418,11 +418,47 @@ def test_summary_reports_the_query_budget_per_parameter():
     )
     summary = ControlledReplayExperiment(tasks, config).run()
     for key in ("sync_rounds", "tuned_parameters", "queries_per_parameter",
-                "query_budget_sufficient", "rho_effective"):
+                "worst_block_queries_per_parameter", "query_budget_sufficient",
+                "rho_effective"):
         assert key in summary
     expected = summary["oracle_queries"] / summary["tuned_parameters"]
     assert np.isclose(summary["queries_per_parameter"], expected)
     assert summary["query_budget_sufficient"] in (0.0, 1.0)
+
+    # Every block receives the same number of evaluations per round whatever
+    # its dimension, so the pooled ratio must not be used on its own: it can
+    # look sufficient while the large blocks are not.  The verdict is the worst
+    # block.
+    per_block = {
+        name: summary[f"queries_per_parameter_{name}"]
+        for name in ("processing", "waiting", "quality")
+    }
+    assert np.isclose(summary["worst_block_queries_per_parameter"], min(per_block.values()))
+    assert summary["query_budget_sufficient"] == float(min(per_block.values()) >= 1.0)
+    # The waiting block is an order of magnitude smaller, so it is resolved
+    # while the two large blocks are not; a pooled ratio would hide that.
+    assert per_block["waiting"] > per_block["processing"]
+    assert summary["queries_per_parameter"] > summary["worst_block_queries_per_parameter"]
+
+
+def test_two_point_methods_are_under_resolved_on_the_paper_blocks():
+    """The reported budget shortfall must be visible, not averaged away."""
+    tasks = synthetic_tasks(120)
+    config = ExperimentConfig(
+        controllers=3, agents=12, seed=7, warmup=10, sync_interval=5,
+        architecture="fixed_replay", optimizer="spsa",
+    )
+    summary = ControlledReplayExperiment(tasks, config).run()
+    assert summary["query_budget_sufficient"] == 0.0
+    assert summary["worst_block_queries_per_parameter"] < 1.0
+
+    # Coordinate-wise KW spends 2d evaluations per round, so it is the one
+    # method that does resolve the block, at a proportionally larger cost.
+    kw = ControlledReplayExperiment(
+        tasks, replace(config, optimizer="kw")
+    ).run()
+    assert kw["worst_block_queries_per_parameter"] >= 1.0
+    assert kw["oracle_queries"] > 10.0 * summary["oracle_queries"]
 
 
 def test_rho_effective_exposes_the_canonical_capacity_reference():

@@ -60,7 +60,11 @@ The manuscript leaves two quantities unspecified. Both are recorded in every art
 
 ### Query budget
 
-Every summary reports `sync_rounds`, `tuned_parameters`, `queries_per_parameter`, and the boolean `query_budget_sufficient`. A two-point zeroth-order method cannot resolve a block whose dimension exceeds its query budget. On the paper-scale test split each controller completes roughly 80 tasks and the processing block carries `agents x 9` parameters, so `queries_per_parameter` is below one for every two-point method. A ranking obtained in that regime reflects the deterministic parts of each recurrence, not gradient information, and must be reported as such. This is a budget limitation of the pinned 1,200-question benchmark at a 60/20/20 split, not a defect of any method.
+Every summary reports `sync_rounds`, `tuned_parameters`, `queries_per_parameter`, the per-block ratios `queries_per_parameter_{processing,waiting,quality}`, `worst_block_queries_per_parameter`, and the boolean `query_budget_sufficient`.
+
+A two-point zeroth-order method cannot resolve a block whose dimension exceeds its query budget. The ratio must be read per block, not pooled: every block receives the same two evaluations per controller per round whatever its dimension, while the blocks differ in size by an order of magnitude. At the selected 3/12 configuration a run completes 43 synchronization rounds, so each block gets 86 evaluations per controller against 108 processing parameters, 9 waiting parameters, and 108 quality parameters. The two-point methods therefore sit at 0.80 on processing and quality and 9.56 on waiting; the pooled ratio of 1.15 looks sufficient and is not. `query_budget_sufficient` tests the worst block and is false for every two-point method. Coordinate-wise KW spends `2d` evaluations per round and is the one method that does resolve the blocks, at roughly 75 times the query cost.
+
+A ranking obtained below one query per parameter reflects the deterministic parts of each recurrence, not gradient information, and must be reported as such. This is a budget limitation of the pinned 1,200-question benchmark at a 60/20/20 split, not a defect of any method.
 
 ## Architecture evaluation
 

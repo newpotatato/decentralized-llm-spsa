@@ -66,7 +66,9 @@ METRICS = (
     "mean_latency", "p95_wait", "mean_cost", "f1", "f2", "f3",
     "mean_utilization", "jain_fairness", "throughput", "oracle_queries",
     "rho_effective", "sync_rounds", "tuned_parameters",
-    "queries_per_parameter", "query_budget_sufficient",
+    "queries_per_parameter", "worst_block_queries_per_parameter",
+    "queries_per_parameter_processing", "queries_per_parameter_waiting",
+    "queries_per_parameter_quality", "query_budget_sufficient",
     "phi_p_auc", "phi_w_auc", "phi_q_auc",
     "phi_p_final", "phi_w_final", "phi_q_final",
     "local_p_final", "local_w_final", "local_q_final",
@@ -792,7 +794,10 @@ def run_suite(args):
                 "received fewer objective evaluations than the block has "
                 "parameters; a ranking obtained in that regime reflects the "
                 "deterministic parts of each recurrence, not gradient "
-                "information."
+                "information.  The ratio is reported per block as well: the "
+                "blocks differ in size by an order of magnitude, so the pooled "
+                "ratio can look sufficient while the two large blocks are not. "
+                "query_budget_sufficient tests the worst block."
             ),
         },
         "code_revision": _git_revision(),
