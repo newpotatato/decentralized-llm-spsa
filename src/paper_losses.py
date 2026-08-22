@@ -15,12 +15,29 @@ class PaperLossConfig:
     epsilon_p: float = 0.05
     a_relevance_p: float = 0.25
     a_hardness_p: float = 0.50
-    lambda_reg_p: float = 1e-5
+    lambda_reg_p: float = 0.002
     wait_under_weight: float = 2.0
     wait_over_weight: float = 1.0
     a_hardness_q: float = 0.50
     a_risk_q: float = 0.50
-    lambda_reg_q: float = 0.0
+    # The manuscript writes a ridge only in F1, as (lambda/2)||theta||^2, and
+    # leaves F2 and F3 unregularised.  Two corrections are made here.
+    #
+    # 1. The penalty is taken about the initial parameters, not about the
+    #    origin.  Processing times live in [1, 4] and qualities in [0.4, 0.9],
+    #    so pulling theta towards zero biases the predictor towards predicting
+    #    no time and no quality: measured held-out RMSE gets monotonically
+    #    worse with lambda under the manuscript form and never beats the frozen
+    #    prior, while the same lambda about the prior beats it by a quarter.
+    #
+    # 2. All three blocks carry one.  The manuscript sets mu = omega*lambda_2,
+    #    but that is the curvature of the disagreement term alone and it
+    #    vanishes on the consensus subspace theta_1 = ... = theta_m.  The only
+    #    curvature Phi has there is the ridge, so acceleration is calibrated to
+    #    a strong convexity the problem does not possess unless every block is
+    #    regularised with lambda >= mu.
+    lambda_reg_q: float = 0.002
+    lambda_reg_w: float = 0.002
 
 
 @dataclass(frozen=True)
@@ -74,16 +91,37 @@ def quality_loss(prediction: float, obs: LossObservation, cfg: PaperLossConfig) 
     return float(base + risk)
 
 
-def ridge_penalty(parameters: np.ndarray | None, coefficient: float) -> float:
-    """Manuscript ``(lambda_reg / 2) * ||theta||^2``.
+def ridge_penalty(
+    parameters: np.ndarray | None,
+    coefficient: float,
+    reference: np.ndarray | None = None,
+) -> float:
+    """``(lambda_reg / 2) * ||theta - reference||^2``.
 
     The manuscript states the penalty per sample; because it does not depend on
-    the observation, the sample mean equals the same term.  It is therefore
-    added once per objective evaluation rather than once per observation.
+    the observation, the sample mean equals the same term, so it is added once
+    per objective evaluation rather than once per observation.
+
+    ``reference`` defaults to the origin, which reproduces the manuscript form
+    exactly.  Passing the initial parameters instead keeps the same curvature -
+    and therefore the same strong-convexity modulus - while removing the bias
+    towards predicting zero.
     """
     if parameters is None or coefficient <= 0.0:
         return 0.0
-    return float(0.5 * coefficient * float(np.sum(np.asarray(parameters, dtype=float) ** 2)))
+    theta = np.asarray(parameters, dtype=float)
+    if reference is not None:
+        theta = theta - np.asarray(reference, dtype=float)
+    return float(0.5 * coefficient * float(np.sum(theta ** 2)))
+
+
+def strong_convexity_floor(cfg: PaperLossConfig) -> dict[str, float]:
+    """Curvature each block contributes on the consensus subspace."""
+    return {
+        "processing": float(cfg.lambda_reg_p),
+        "waiting": float(cfg.lambda_reg_w),
+        "quality": float(cfg.lambda_reg_q),
+    }
 
 
 def mean_losses(
@@ -94,6 +132,10 @@ def mean_losses(
     cfg: PaperLossConfig,
     processing_parameters: np.ndarray | None = None,
     quality_parameters: np.ndarray | None = None,
+    waiting_parameters: np.ndarray | None = None,
+    processing_reference: np.ndarray | None = None,
+    waiting_reference: np.ndarray | None = None,
+    quality_reference: np.ndarray | None = None,
 ) -> tuple[float, float, float]:
     """Mean F1/F2/F3 including the manuscript ridge terms of F1 and F3.
 
@@ -101,15 +143,16 @@ def mean_losses(
     reported values to match the objective actually optimised; omitting them
     reproduces the unregularised data terms only.
     """
-    reg_p = ridge_penalty(processing_parameters, cfg.lambda_reg_p)
-    reg_q = ridge_penalty(quality_parameters, cfg.lambda_reg_q)
+    reg_p = ridge_penalty(processing_parameters, cfg.lambda_reg_p, processing_reference)
+    reg_w = ridge_penalty(waiting_parameters, cfg.lambda_reg_w, waiting_reference)
+    reg_q = ridge_penalty(quality_parameters, cfg.lambda_reg_q, quality_reference)
     if not observations:
-        return reg_p, 0.0, reg_q
+        return reg_p, reg_w, reg_q
     f1 = [processing_loss(predict_processing(o), o, cfg) for o in observations]
     f2 = [waiting_loss(predict_waiting(o), o, cfg) for o in observations]
     f3 = [quality_loss(predict_quality(o), o, cfg) for o in observations]
     return (
         float(np.mean(f1)) + reg_p,
-        float(np.mean(f2)),
+        float(np.mean(f2)) + reg_w,
         float(np.mean(f3)) + reg_q,
     )

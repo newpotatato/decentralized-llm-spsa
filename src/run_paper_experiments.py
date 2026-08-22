@@ -66,12 +66,14 @@ METRICS = (
     "mean_latency", "p95_wait", "mean_cost", "f1", "f2", "f3",
     "mean_utilization", "jain_fairness", "throughput", "oracle_queries",
     "rho_effective", "sync_rounds", "tuned_parameters",
+    "true_processing_rmse", "true_quality_rmse", "domain_mix_total_variation",
     "queries_per_parameter", "worst_block_queries_per_parameter",
     "queries_per_parameter_processing", "queries_per_parameter_waiting",
     "queries_per_parameter_quality", "query_budget_sufficient",
     "phi_p_auc", "phi_w_auc", "phi_q_auc",
     "phi_p_final", "phi_w_final", "phi_q_final",
     "local_p_final", "local_w_final", "local_q_final",
+    "data_p_final", "data_w_final", "data_q_final",
     "disagreement_p_auc", "disagreement_w_auc", "disagreement_q_auc",
     "disagreement_p_final", "disagreement_w_final", "disagreement_q_final",
 )
@@ -82,7 +84,8 @@ METRICS = (
 # alone ranked methods by how hard they averaged parameters.  The two
 # components are therefore prespecified endpoints in their own right.
 OPTIMIZER_PRIMARY_METRICS = (
-    "local_p_final", "local_w_final", "local_q_final",
+    "data_p_final", "data_w_final", "data_q_final",
+    "true_processing_rmse", "true_quality_rmse",
     "disagreement_p_auc", "disagreement_w_auc", "disagreement_q_auc",
     "phi_p_auc", "phi_w_auc", "phi_q_auc",
 )
@@ -418,8 +421,15 @@ def _tune_methods(
         the averaged ring Laplacian, so it is derived from omega rather than
         tuned.
         """
-        lambda_2, _ = ring_laplacian_spectrum(base.controllers)
-        mu_minus_eta = max(0.5 * NETWORK_OMEGA * lambda_2, 1e-6)
+        # mu is the strong-convexity modulus of the network objective, which
+        # on the consensus subspace is the ridge, not omega*lambda_2.
+        ridge = {
+            "processing": base.loss.lambda_reg_p,
+            "waiting": base.loss.lambda_reg_w,
+            "quality": base.loss.lambda_reg_q,
+        }[block_name]
+        mu = theory_parameters(1.0, NETWORK_OMEGA, base.controllers, ridge)["mu"]
+        mu_minus_eta = max(0.5 * mu, 1e-6)
         return tuple(
             OptimizerConfig(
                 step_size=step,
@@ -644,10 +654,15 @@ def _theory_report(config: ExperimentConfig) -> dict:
         "lipschitz_constants": constants,
         "blocks": {},
     }
+    ridges = {
+        "processing": config.loss.lambda_reg_p,
+        "waiting": config.loss.lambda_reg_w,
+        "quality": config.loss.lambda_reg_q,
+    }
     for index, (block, key) in enumerate(blocks.items()):
         omega = config.network_omega[index]
         report["blocks"][block] = theory_parameters(
-            constants[key], omega, config.controllers
+            constants[key], omega, config.controllers, ridges[block]
         )
     return report
 

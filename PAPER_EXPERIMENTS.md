@@ -54,6 +54,92 @@ The manuscript leaves two quantities unspecified. Both are recorded in every art
 - `alpha_0` is not specified; the neutral choice `alpha_0 = 0` is used.
 - `z_{j,0} = 0` is specified. For a regression model whose parameters are not centred at the origin this is an implicit shrinkage prior, so `surrogate_init` is a selectable field and the manuscript value remains the default.
 
+## Audit of the manuscript's assumptions
+
+`python -m src.theory_check` derives every constant of the manuscript's
+verification section and measures it on a real run; the regression tests are in
+`tests/test_protocol_fairness.py`. Five things were wrong and are now fixed.
+
+**Features were not normalised.** The manuscript sets `X_max = Z_max = 1` and
+derives `M_p = X^2/eps_p^2 = 400` from it. The raw feature vector reached
+`||x|| = 1.93`, so every constant was understated by `X_max^2 = 3.7` and the
+prescribed step `h = 1/M` was four times too large. Features are now scaled by
+their largest attainable norm, which is a change of units: it rescales `theta`,
+the feasible box and `h` together and leaves the model class untouched. The
+queue-occupancy coordinate is additionally saturated at one agent-equivalent,
+because under load it was unbounded and reached 3.8.
+
+**The queried oracle was not convex.** `objective_block` projected the vector
+into the feasible box before evaluating, so the optimizer queried `F(project(.))`
+rather than `F`. Measured minimum second difference along a ray was `-1.8e-2`.
+Assumption 3 is about the function the oracle returns, so the projection now
+applies to the iterate only, where feasibility belongs; the measured second
+difference is positive at every scale.
+
+**`mu` is not `omega * lambda_2`.** The Hessian of the network objective is
+`blockdiag(grad^2 F_j) + omega (L_av kron I)`, and the second summand vanishes on
+the consensus subspace `theta_1 = ... = theta_m`. On that subspace the modulus is
+whatever the ridge supplies. With the manuscript's `lambda_reg_p = 1e-5` and no
+ridge at all in F2 and F3, the objective is convex but not strongly convex, so
+the acceleration is calibrated to a modulus the problem does not have. All three
+blocks now carry a ridge at or above `omega * lambda_2`, and
+`theory_parameters` reports `mu` and `mu_manuscript` side by side.
+
+**The ridge pulled towards the origin.** F1 is written `(lambda/2)||theta||^2`.
+Processing times live in [1, 4] and qualities in [0.4, 0.9], so shrinking
+towards zero biases the predictor towards predicting no time and no quality:
+held-out RMSE gets monotonically worse with `lambda` under that form and never
+beats the frozen prior, while the same `lambda` about the initial parameters
+beats it. The penalty is now taken about `theta_0`, which preserves the
+curvature and therefore the strong-convexity modulus.
+
+**The prediction features indexed a different quantity than the oracle.** The
+feature vector carried the multi-label `skill_vector`, which activates two or
+three domain coordinates for the 16.7% of tasks with several recognised tags,
+while the replay oracle conditions the outcome on `primary_skill` alone. Least
+squares split the credit between the active coordinates and biased every domain
+coefficient towards a fraction of its value: refitting by ordinary least squares
+on the same window reproduced the same bias, so it was the design and not the
+estimator. Features are now the one-hot primary domain; the full tag vector is
+retained and is still what `semantic_relevance` consumes.
+
+Two assumptions remain unmet and are reported rather than repaired:
+
+- **No common minimizer.** Assumption 3 needs `theta*` in the intersection of
+  the controllers' argmins. The controllers fit different rolling windows and
+  their gradients at a common point have pairwise cosines of 0.5-0.9 with none
+  vanishing. Nothing in the protocol enforces the intersection.
+- **The communication half of Assumption 1 is not exercised.** `B_tau` is a
+  fixed ring, so `sigma_B = sigma_zeta = 0`, and at `m = 3` the ring is the
+  complete graph, where `lambda_2 = lambda_max` and the spectral gap carries no
+  information.
+
+### Separating the local estimator from the analytic ridge
+
+Recursive least squares minimises a sum of squares while the objective is a
+mean, so one coefficient cannot play both roles - it would differ by the window
+length. `rls_prior_strength` is the prior strength of the local estimator
+(`P_0 = I / strength`, i.e. a sum-form ridge about `theta_0`) and
+`loss.lambda_reg_*` is the mean-form ridge inside the A-SPSA objective, sized to
+supply strong convexity. The previous `P_0 = 20 I` made the prior almost
+vacuous.
+
+Because a ridge large enough to give strong convexity is also large enough to
+dominate the number a reader takes for the data fit, every round reports
+`data_*` (the loss alone), `ridge_*` and `local_* = data_* + ridge_*`, and
+`data_*` is the prespecified endpoint.
+
+### Held-out accuracy is a primary endpoint
+
+`Phi` and its parts are in-sample quantities over a rolling window of the pairs
+a controller happened to select, so they cannot settle whether a method learned
+anything. `true_processing_rmse` and `true_quality_rmse` measure the fitted
+models against the generative relationship over every `(agent, domain,
+hardness)` cell, including those never observed, and are prespecified endpoints.
+Response quality carries the largest weight in the routing score
+(`1.10 q_hat` against `-0.16 p_hat`), so its accuracy is the one that matters
+operationally.
+
 ### Theory conditions are checked, not assumed
 
 `src.paper_optimizers.theory_parameters` computes the manuscript prescription `mu = omega * lambda_2(L_av)`, `h = 1 / max{M_nu, omega * lambda_max(L_av)}`, and `0 < eta < mu` from the verified Lipschitz constants `M_p = X^2/eps_p^2`, `M_w = 2 a_w^- X^2`, `M_q = 2(1 + a_h^q + a_R^q) Z^2`. Nothing in the search enforces these bounds, so `experiment_manifest.json` records them under `theory_check` and any violation is visible. For the paper loss configuration `M_p = 400`, so the prescribed processing step is `h = 0.0025`; the previous run selected `h = 12`, roughly 4800 times the theoretical bound.

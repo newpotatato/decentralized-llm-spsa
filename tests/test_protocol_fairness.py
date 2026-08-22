@@ -38,13 +38,22 @@ requires_manifest = pytest.mark.skipif(
 
 
 def synthetic_tasks(count: int, agents: int = 6) -> list[ReplayTask]:
+    """A task stream with no aliasing against the replay assignment.
+
+    ``fixed_replay`` sends task ``i`` to agent ``i mod n``, so a domain
+    assigned as ``i mod 6`` would lock each agent to a single domain whenever
+    ``n`` is a multiple of six, leaving most of every agent row unobservable.
+    Drawing the domain and the hardness from a seeded generator keeps the
+    stream balanced without inducing that correlation.
+    """
+    rng = np.random.default_rng(20240517)
     tasks = []
     for index in range(count):
-        domain = index % 6
+        domain = int(rng.integers(6))
         vector = tuple(1.0 if pos == domain else 0.0 for pos in range(6))
         tasks.append(ReplayTask(
             index, f"synthetic-{index}", domain, vector,
-            (0.25, 0.60, 1.0)[index % 3], 0.4, 300 + index, False,
+            float(rng.choice((0.25, 0.60, 1.0))), 0.4, 300 + index, False,
             index * 0.3, index * 0.3 + 6.0,
         ))
     return tasks
@@ -306,17 +315,104 @@ def test_surrogate_initialisation_is_selectable_and_recorded():
     assert np.allclose(first_probe("theta"), 5.0)
 
 
-def test_theory_parameters_match_the_manuscript_prescription():
-    """mu = omega*lambda_2, h = 1/max{M, omega*lambda_max}, 0 < eta < mu."""
+def test_strong_convexity_modulus_is_the_ridge_not_omega_lambda_2():
+    """The manuscript's mu is the modulus on the disagreement subspace only.
+
+    The Hessian of the network objective is blockdiag(grad^2 F_j) + omega L (x) I.
+    The second summand vanishes on the consensus subspace theta_1 = ... = theta_m,
+    so the modulus there is whatever the ridge supplies.  With the manuscript's
+    unregularised F2 and F3 that is zero and the objective is convex but not
+    strongly convex, which is precisely what the acceleration assumes.
+    """
     lambda_2, lambda_max = ring_laplacian_spectrum(3)
     assert lambda_2 > 0.0 and lambda_max >= lambda_2
     constants = lipschitz_constants(PaperLossConfig())
-    # M_p = X^2 / epsilon_p^2 with X = 1 and epsilon_p = 0.05.
+    # M_p = X^2 / epsilon_p^2, valid because the features are normalised.
     assert np.isclose(constants["M_p"], 400.0)
-    prescription = theory_parameters(constants["M_p"], 0.002, 3)
-    assert np.isclose(prescription["mu"], 0.002 * lambda_2)
-    assert np.isclose(prescription["h_theory"], 1.0 / 400.0)
-    assert prescription["eta_upper_bound"] == prescription["mu"]
+
+    unregularised = theory_parameters(constants["M_p"], 0.002, 3, ridge=0.0)
+    assert unregularised["mu"] == 0.0
+    assert not unregularised["strongly_convex"]
+    assert np.isclose(unregularised["mu_manuscript"], 0.002 * lambda_2)
+
+    regularised = theory_parameters(constants["M_p"], 0.002, 3, ridge=0.01)
+    assert np.isclose(regularised["mu"], 0.01)
+    assert regularised["strongly_convex"]
+    assert regularised["eta_upper_bound"] == regularised["mu"]
+    assert np.isclose(regularised["h_theory"], 1.0 / 400.0)
+
+
+def test_every_block_is_regularised_above_the_network_modulus():
+    """Acceleration needs mu > 0 in every block it is applied to."""
+    from src.paper_losses import strong_convexity_floor
+
+    cfg = PaperLossConfig()
+    mu_network = 0.002 * ring_laplacian_spectrum(3)[0]
+    floors = strong_convexity_floor(cfg)
+    assert set(floors) == {"processing", "waiting", "quality"}
+    for block, value in floors.items():
+        assert value >= mu_network, (block, value, mu_network)
+
+
+def test_features_are_normalised_so_the_manuscript_constants_hold():
+    """M_p = X_max^2 / eps_p^2 is only 400 when X_max = 1."""
+    tasks = synthetic_tasks(40)
+    experiment = ControlledReplayExperiment(
+        tasks, ExperimentConfig(controllers=2, agents=3, seed=3, warmup=6,
+                                sync_interval=3, architecture="fixed_replay")
+    )
+    seen = []
+    original = experiment._prediction_features
+
+    def spy(task, now):
+        vector = original(task, now)
+        seen.append(vector.copy())
+        return vector
+
+    experiment._prediction_features = spy
+    experiment.run()
+    assert np.linalg.norm(np.asarray(seen), axis=1).max() <= 1.0
+
+
+def test_the_queried_oracle_is_convex():
+    """Assumption 3 is about the function the oracle returns.
+
+    Composing a convex loss with the box projection makes it non-convex, so the
+    projection belongs on the iterate and not inside the evaluation.
+    """
+    tasks = synthetic_tasks(60)
+    experiment = ControlledReplayExperiment(
+        tasks, ExperimentConfig(controllers=2, agents=3, seed=3, warmup=6,
+                                sync_interval=3, architecture="fixed_replay")
+    )
+    experiment.run()
+    controller = experiment.controllers[0]
+    base = controller.pack_parameters()
+    block = dict(controller.parameter_blocks())["processing"]
+    direction = np.zeros_like(base)
+    direction[block] = 1.0
+    for span in (5.0, 60.0):
+        grid = np.linspace(-span, span, 200)
+        curve = np.array([controller.objective_block(base + t * direction, "processing")
+                          for t in grid])
+        assert np.diff(curve, 2).min() > -1e-9, span
+
+
+def test_prediction_features_index_the_same_domain_the_oracle_conditions_on():
+    """One active domain coordinate, matching primary_skill.
+
+    The multi-label tag vector activated two or three coordinates for the tasks
+    carrying several recognised tags while the outcome still came from the
+    primary one; least squares split the credit and biased every domain
+    coefficient towards a fraction of its true value.
+    """
+    task = ReplayTask(0, "multi", 2, (1.0, 0.0, 1.0, 0.0, 1.0, 0.0),
+                      0.6, 0.4, 300, False, 0.0, 6.0)
+    active = np.flatnonzero(task.features[:6] > 0)
+    assert active.tolist() == [2]
+    assert np.isclose(task.features[6], 0.6)
+    # The full tag vector is still available for the relevance term.
+    assert sum(task.skill_vector) == 3.0
 
 
 # --------------------------------------------------------------------------
@@ -597,9 +693,16 @@ def test_every_method_receives_the_identical_tuning_grid():
 def test_optimizer_primary_metrics_separate_accuracy_from_agreement():
     from src.run_paper_experiments import OPTIMIZER_PRIMARY_METRICS
 
-    assert any(name.startswith("local_") for name in OPTIMIZER_PRIMARY_METRICS)
+    # The data term, the agreement term and their weighted sum are all
+    # prespecified, so a win on Phi cannot be reported without the reader also
+    # seeing which of the two components produced it.
+    assert any(name.startswith("data_") for name in OPTIMIZER_PRIMARY_METRICS)
     assert any(name.startswith("disagreement_") for name in OPTIMIZER_PRIMARY_METRICS)
     assert any(name.startswith("phi_") for name in OPTIMIZER_PRIMARY_METRICS)
+    # Held-out accuracy against the generative model is prespecified too: the
+    # windowed terms are in-sample and cannot settle whether a method learned.
+    assert "true_processing_rmse" in OPTIMIZER_PRIMARY_METRICS
+    assert "true_quality_rmse" in OPTIMIZER_PRIMARY_METRICS
 
 
 def test_significance_table_flags_the_exact_test_resolution_floor(tmp_path):
@@ -688,21 +791,20 @@ def test_true_processing_error_is_reported_and_is_not_the_windowed_loss():
                     "domain_mix_total_variation"):
             assert key in summary and np.isfinite(summary[key])
 
-    # Fitting lowers the windowed objective ...
-    assert fitted["local_p_final"] < frozen["local_p_final"]
+    # Fitting lowers the windowed data term ...
+    assert fitted["data_p_final"] < frozen["data_p_final"]
     # ... and the two quantities are genuinely different measurements, so a
     # drop in one must never be reported as evidence about the other.
     assert not np.isclose(fitted["true_processing_rmse"], fitted["local_p_final"])
 
 
-def test_frozen_prior_recovers_the_truth_better_than_the_fitted_model():
-    """Documents the overfitting regime the benchmark currently sits in.
+def test_fitting_now_moves_towards_the_truth_not_away_from_it():
+    """The estimator must improve held-out accuracy, not only the window.
 
-    108 processing parameters against roughly 80 observations per controller,
-    with a median of one sample per (agent, domain) cell: recursive least
-    squares reduces the rolling-window loss while increasing the error against
-    the generative model.  If this ever stops holding, the budget or the
-    parameterisation has changed and the audit needs revisiting.
+    Before the feature indexing, normalisation and shrinkage were corrected the
+    opposite held: recursive least squares drove the rolling-window objective
+    down while moving the parameters further from the generative model than the
+    prior it started from.  This pins the corrected behaviour.
     """
     tasks = synthetic_tasks(240)
     shared = dict(controllers=3, agents=12, seed=11, warmup=10, sync_interval=5,
@@ -714,5 +816,8 @@ def test_frozen_prior_recovers_the_truth_better_than_the_fitted_model():
     fitted = ControlledReplayExperiment(
         tasks, ExperimentConfig(optimizer="local_rls", **shared)
     ).run()
-    assert fitted["local_p_final"] < frozen["local_p_final"]
-    assert fitted["true_processing_rmse"] > frozen["true_processing_rmse"]
+    assert fitted["data_p_final"] < frozen["data_p_final"]
+    assert fitted["true_processing_rmse"] < frozen["true_processing_rmse"]
+    assert fitted["true_quality_rmse"] < frozen["true_quality_rmse"]
+    # The ridge is part of F_j, so local_* carries it and data_* does not.
+    assert fitted["local_p_final"] >= fitted["data_p_final"]

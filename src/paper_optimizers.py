@@ -426,24 +426,41 @@ def ring_laplacian_spectrum(controllers: int) -> tuple[float, float]:
 
 
 def theory_parameters(
-    smoothness: float, omega: float, controllers: int
+    smoothness: float, omega: float, controllers: int, ridge: float = 0.0
 ) -> dict[str, float]:
-    """Manuscript prescription mu = omega*lambda_2, h = 1/max{M, omega*lambda_max}.
+    """Strong-convexity modulus and step size of the network problem.
 
-    The manuscript additionally requires ``0 < eta < mu``.  These values are
-    recorded so that a selected configuration can be checked against the
-    conditions under which acceleration is justified, rather than silently
-    violating them.
+    The manuscript states ``mu = omega * lambda_2(L_av)``.  That is the
+    curvature of the disagreement term, and the Hessian of the network
+    objective is
+
+        blockdiag(grad^2 F_j)  +  omega * (L_av kron I),
+
+    whose second summand is positive semidefinite with a null space spanned by
+    the consensus subspace ``theta_1 = ... = theta_m``.  On that subspace the
+    disagreement term contributes nothing, so
+
+        mu  =  lambda_min  >=  ridge + 0  =  ridge,
+
+    and ``omega * lambda_2`` is only the modulus *restricted to the orthogonal
+    complement*.  With an unregularised block the problem is convex but not
+    strongly convex, and the acceleration is calibrated to a modulus the
+    objective does not have.  ``mu_manuscript`` is reported alongside so the
+    discrepancy stays visible.
     """
     lambda_2, lambda_max = ring_laplacian_spectrum(controllers)
-    mu = omega * lambda_2
+    mu_manuscript = omega * lambda_2
+    mu = float(ridge)
     step = 1.0 / max(smoothness, omega * lambda_max, 1e-12)
     return {
         "lambda_2": lambda_2,
         "lambda_max": lambda_max,
         "mu": mu,
+        "mu_manuscript": mu_manuscript,
+        "mu_on_disagreement_subspace": mu_manuscript,
         "h_theory": step,
         "eta_upper_bound": mu,
+        "strongly_convex": bool(mu > 0.0),
     }
 
 

@@ -8,7 +8,7 @@ pairs.
 from __future__ import annotations
 
 from collections import Counter, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import hashlib
 import heapq
 import json
@@ -32,6 +32,11 @@ DOMAIN_ORDER = tuple(ITSkill)
 DOMAIN_INDEX = {skill.value: index for index, skill in enumerate(DOMAIN_ORDER)}
 DIFFICULTY = {"easy": 0.25, "medium": 0.60, "hard": 1.0}
 EPSILON_RELEVANCE = 1e-9
+# Largest attainable norm of the raw feature vector: one active domain
+# indicator plus hardness, busy fraction and queue occupancy, each in [0, 1].
+RAW_FEATURE_NORM = 2.0
+# Indices of the coordinates that describe system load rather than the task.
+LOAD_FEATURE_INDICES = (7, 8)
 # Raised from 12 so the selected configuration is no longer pinned to the
 # upper boundary of the architecture search grid.
 MAX_AGENTS = 18
@@ -70,8 +75,19 @@ class ReplayTask:
 
     @property
     def features(self) -> np.ndarray:
+        """One-hot primary domain plus task hardness.
+
+        The replay oracle conditions the outcome on ``primary_skill`` alone, so
+        the predictor must be indexed the same way.  Using the multi-label
+        ``skill_vector`` here activated two or three domain coordinates for the
+        16.7% of tasks that carry several recognised tags, while the target
+        still came from one of them; least squares then split the credit and
+        biased every domain coefficient towards a fraction of its true value.
+        The full tag vector is retained on the task and is still what
+        ``semantic_relevance`` consumes.
+        """
         out = np.zeros(len(DOMAIN_ORDER) + 1, dtype=float)
-        out[:len(DOMAIN_ORDER)] = np.asarray(self.skill_vector, dtype=float)
+        out[self.domain] = 1.0
         out[-1] = self.hardness
         return out
 
@@ -122,6 +138,29 @@ class ExperimentConfig:
     #              controller never observes the domains it does not route, so
     #              those parameters can only improve through its neighbours.
     controller_assignment: str = "load"
+    # The manuscript's verification of Assumption 4 sets X_max = Z_max = 1 and
+    # derives M_p = X^2/eps_p^2 = 400 from it.  The raw feature vector has
+    # ||x|| up to 2, so every constant it states is understated by X_max^2 and
+    # the prescribed step h = 1/M is four times too large.  Scaling the
+    # features by their largest attainable norm is a change of units - it
+    # rescales theta and h and leaves the model class untouched - which makes
+    # the manuscript's own constants correct rather than approximately correct.
+    normalize_features: bool = True
+    # Strength of the prior in the local estimator, as a ridge in the
+    # sum-of-squares sense: P_0 = I / rls_prior_strength.  This is a separate
+    # quantity from loss.lambda_reg_*, which is a mean-form ridge inside the
+    # A-SPSA objective and is sized to supply strong convexity.  Recursive
+    # least squares minimises a SUM, the objective a MEAN, so one number cannot
+    # play both roles - it would differ by the window length.  The previous
+    # P_0 = 20 I made the prior almost vacuous and the fitted model ended up
+    # further from the truth than the prior it started from.
+    rls_prior_strength: float = 1.0
+    # The replay oracle draws service time and quality independently of system
+    # load, so the busy-fraction and queue coordinates carry no signal for
+    # those two targets and only absorb noise.  Realised waiting time is a
+    # queueing quantity and genuinely depends on both, so the waiting model
+    # keeps them.  Set False to give every block all coordinates.
+    load_features_for_waiting_only: bool = True
     # omega is calibrated so the disagreement penalty is commensurate with the
     # local losses it regularises.  At omega = 0.05 the penalty reached 0.6-1.9
     # while the whole local objective was 0.02-0.18, so Phi ranked methods by
@@ -249,30 +288,64 @@ class PaperController:
         self.cfg = cfg
         # six domain coordinates + hardness + busy fraction + buffer pressure
         self.feature_dim = len(DOMAIN_ORDER) + 3
+        # Scaling the features by RAW_FEATURE_NORM is a change of units, so the
+        # initial parameters and the feasible box must be expressed in the same
+        # units or every prediction is off by exactly that factor.
+        self.parameter_scale = RAW_FEATURE_NORM if cfg.normalize_features else 1.0
+        unit = self.parameter_scale
         self.theta_time = np.zeros((len(agents), self.feature_dim))
-        self.theta_time[:, :len(DOMAIN_ORDER)] = 1.6
-        self.theta_time[:, len(DOMAIN_ORDER)] = 1.0
+        self.theta_time[:, :len(DOMAIN_ORDER)] = 1.6 * unit
+        self.theta_time[:, len(DOMAIN_ORDER)] = 1.0 * unit
         self.theta_wait = np.zeros(self.feature_dim)
-        self.theta_wait[:len(DOMAIN_ORDER)] = 0.20
-        self.theta_wait[len(DOMAIN_ORDER)] = 0.20
-        self.theta_wait[-2:] = (1.0, 0.5)
+        self.theta_wait[:len(DOMAIN_ORDER)] = 0.20 * unit
+        self.theta_wait[len(DOMAIN_ORDER)] = 0.20 * unit
+        self.theta_wait[-2:] = (1.0 * unit, 0.5 * unit)
         self.theta_quality = np.zeros((len(agents), self.feature_dim))
-        self.theta_quality[:, :len(DOMAIN_ORDER)] = 0.62
-        self.theta_quality[:, len(DOMAIN_ORDER)] = -0.12
-        self.p_time = np.stack([np.eye(self.feature_dim) * 20.0 for _ in agents])
-        self.p_wait = np.eye(self.feature_dim) * 20.0
-        self.p_quality = np.stack([np.eye(self.feature_dim) * 20.0 for _ in agents])
+        self.theta_quality[:, :len(DOMAIN_ORDER)] = 0.62 * unit
+        self.theta_quality[:, len(DOMAIN_ORDER)] = -0.12 * unit
+        # Recursive least squares started at theta_0 with covariance P_0 =
+        # (1/lambda) I is exactly ridge regression about theta_0 with
+        # coefficient lambda, so the local estimator and the ridge inside the
+        # A-SPSA objective are the same regularisation rather than two
+        # unrelated ones.  P_0 = 20 I made the prior almost vacuous.
+        self.prior_time = self.theta_time.copy()
+        self.prior_wait = self.theta_wait.copy()
+        self.prior_quality = self.theta_quality.copy()
+        self.ridge_p = cfg.loss.lambda_reg_p / self.parameter_scale**2
+        self.ridge_w = cfg.loss.lambda_reg_w / self.parameter_scale**2
+        self.ridge_q = cfg.loss.lambda_reg_q / self.parameter_scale**2
+        prior_strength = max(cfg.rls_prior_strength, 1e-9) / self.parameter_scale**2
+        covariance = np.eye(self.feature_dim) / prior_strength
+        self.p_time = np.stack([covariance.copy() for _ in agents])
+        self.p_wait = covariance.copy()
+        self.p_quality = np.stack([covariance.copy() for _ in agents])
         self.observations: deque[LossObservation] = deque(maxlen=cfg.history_size)
         self.active_tasks = 0
 
+    def task_features(self, features: np.ndarray) -> np.ndarray:
+        """Features visible to the processing and quality models.
+
+        The load coordinates are masked out for these two blocks: in the replay
+        oracle neither service time nor quality depends on system load, so
+        those coordinates are pure noise absorbers there.  Masking rather than
+        removing keeps the parameter layout stable for every consumer.
+        """
+        if not self.cfg.load_features_for_waiting_only:
+            return features
+        masked = np.asarray(features, dtype=float).copy()
+        masked[list(LOAD_FEATURE_INDICES)] = 0.0
+        return masked
+
     def predict_processing(self, agent_id: int, features: np.ndarray) -> float:
-        return float(np.clip(self.theta_time[agent_id] @ features, 0.05, 20.0))
+        x = self.task_features(features)
+        return float(np.clip(self.theta_time[agent_id] @ x, 0.05, 20.0))
 
     def predict_waiting(self, features: np.ndarray) -> float:
         return float(np.clip(self.theta_wait @ features, 0.0, 30.0))
 
     def predict_quality(self, agent_id: int, features: np.ndarray) -> float:
-        return float(np.clip(self.theta_quality[agent_id] @ features, 0.0, 1.0))
+        x = self.task_features(features)
+        return float(np.clip(self.theta_quality[agent_id] @ x, 0.0, 1.0))
 
     @staticmethod
     def _rls(theta: np.ndarray, covariance: np.ndarray, x: np.ndarray, target: float, forgetting: float = 0.99):
@@ -287,14 +360,15 @@ class PaperController:
         if not self.cfg.use_rls:
             return
         aid, x = observation.agent_id, observation.features
+        task_only = self.task_features(x)
         self.theta_time[aid], self.p_time[aid] = self._rls(
-            self.theta_time[aid], self.p_time[aid], x, observation.processing_real
+            self.theta_time[aid], self.p_time[aid], task_only, observation.processing_real
         )
         self.theta_wait, self.p_wait = self._rls(
             self.theta_wait, self.p_wait, x, observation.waiting_real
         )
         self.theta_quality[aid], self.p_quality[aid] = self._rls(
-            self.theta_quality[aid], self.p_quality[aid], x, observation.quality_real
+            self.theta_quality[aid], self.p_quality[aid], task_only, observation.quality_real
         )
         self.unpack_parameters(self.pack_parameters())
 
@@ -316,20 +390,40 @@ class PaperController:
             ("quality", slice(matrix_size + self.feature_dim, 2 * matrix_size + self.feature_dim)),
         )
 
+    def block_regularizer(self, block_name: str) -> float:
+        """Ridge term of one block at the current parameters."""
+        if block_name == "processing":
+            return ridge_penalty(self.theta_time, self.ridge_p, self.prior_time)
+        if block_name == "waiting":
+            return ridge_penalty(self.theta_wait, self.ridge_w, self.prior_wait)
+        if block_name == "quality":
+            return ridge_penalty(self.theta_quality, self.ridge_q, self.prior_quality)
+        raise ValueError(f"unknown parameter block: {block_name}")
+
     def objective_block(self, vector: np.ndarray, block_name: str) -> float:
+        """Rolling-window objective of one block, evaluated as written.
+
+        The vector is deliberately NOT projected here.  Composing a convex loss
+        with a box projection gives a non-convex function, and Assumption 3 of
+        the manuscript is about the function the oracle returns.  Feasibility is
+        maintained where it belongs, on the iterate, by the optimizer calling
+        ``project`` after each step.
+        """
         if not self.observations:
             return 0.0
-        time, wait, quality = self._split(self.project(vector))
+        time, wait, quality = self._split(np.asarray(vector, dtype=float))
         observations = list(self.observations)
         if block_name == "processing":
-            values = [processing_loss(float(time[o.agent_id] @ o.features), o, self.cfg.loss) for o in observations]
-            regularizer = ridge_penalty(time, self.cfg.loss.lambda_reg_p)
+            values = [processing_loss(float(time[o.agent_id] @ self.task_features(o.features)), o, self.cfg.loss)
+                      for o in observations]
+            regularizer = ridge_penalty(time, self.ridge_p, self.prior_time)
         elif block_name == "waiting":
             values = [waiting_loss(float(wait @ o.features), o, self.cfg.loss) for o in observations]
-            regularizer = 0.0
+            regularizer = ridge_penalty(wait, self.ridge_w, self.prior_wait)
         elif block_name == "quality":
-            values = [quality_loss(float(quality[o.agent_id] @ o.features), o, self.cfg.loss) for o in observations]
-            regularizer = ridge_penalty(quality, self.cfg.loss.lambda_reg_q)
+            values = [quality_loss(float(quality[o.agent_id] @ self.task_features(o.features)), o, self.cfg.loss)
+                      for o in observations]
+            regularizer = ridge_penalty(quality, self.ridge_q, self.prior_quality)
         else:
             raise ValueError(f"unknown parameter block: {block_name}")
         return float(np.mean(values) + regularizer)
@@ -338,11 +432,12 @@ class PaperController:
         self.theta_time, self.theta_wait, self.theta_quality = time, wait, quality
 
     def project(self, vector: np.ndarray) -> np.ndarray:
+        unit = self.parameter_scale
         time, wait, quality = self._split(np.asarray(vector, dtype=float))
         return np.concatenate((
-            np.clip(time, -5.0, 20.0).ravel(),
-            np.clip(wait, -10.0, 30.0),
-            np.clip(quality, -2.0, 2.0).ravel(),
+            np.clip(time, -5.0 * unit, 20.0 * unit).ravel(),
+            np.clip(wait, -10.0 * unit, 30.0 * unit),
+            np.clip(quality, -2.0 * unit, 2.0 * unit).ravel(),
         ))
 
     def objective(self, vector: np.ndarray) -> float:
@@ -353,15 +448,18 @@ class PaperController:
         """
         if not self.observations:
             return 0.0
-        time, wait, quality = self._split(self.project(vector))
+        time, wait, quality = self._split(np.asarray(vector, dtype=float))
         f1, f2, f3 = mean_losses(
             list(self.observations),
-            lambda o: float(time[o.agent_id] @ o.features),
+            lambda o: float(time[o.agent_id] @ self.task_features(o.features)),
             lambda o: float(wait @ o.features),
-            lambda o: float(quality[o.agent_id] @ o.features),
-            self.cfg.loss,
-            processing_parameters=time,
-            quality_parameters=quality,
+            lambda o: float(quality[o.agent_id] @ self.task_features(o.features)),
+            replace(self.cfg.loss, lambda_reg_p=self.ridge_p,
+                    lambda_reg_w=self.ridge_w, lambda_reg_q=self.ridge_q),
+            processing_parameters=time, quality_parameters=quality,
+            waiting_parameters=wait,
+            processing_reference=self.prior_time, waiting_reference=self.prior_wait,
+            quality_reference=self.prior_quality,
         )
         return f1 + f2 + f3
 
@@ -381,8 +479,34 @@ class PaperController:
                     features = np.zeros(self.feature_dim)
                     features[domain] = 1.0
                     features[len(DOMAIN_ORDER)] = hardness
+                    # The live features are expressed in scaled units, so the
+                    # probe must be too or every prediction is off by exactly
+                    # the scale factor.
+                    features = self.task_features(features / self.parameter_scale)
                     truth = float(agent.mean_service[domain]) * (1.0 + 0.70 * hardness)
                     prediction = float(self.theta_time[agent_id] @ features)
+                    errors.append(prediction - truth)
+                    relative.append(abs(prediction - truth) / max(truth, 1e-9))
+        errors = np.asarray(errors, dtype=float)
+        return float(np.sqrt(np.mean(errors**2))), float(np.mean(relative))
+
+    def true_quality_error(self, agents: list[AgentSpec]) -> tuple[float, float]:
+        """The same held-out check for the response-quality model.
+
+        Quality carries the largest weight in the routing score, so it is the
+        block whose accuracy matters most operationally.
+        """
+        errors, relative = [], []
+        for agent_id, agent in enumerate(agents):
+            for domain in range(len(DOMAIN_ORDER)):
+                for hardness in DIFFICULTY.values():
+                    features = np.zeros(self.feature_dim)
+                    features[domain] = 1.0
+                    features[len(DOMAIN_ORDER)] = hardness
+                    features = self.task_features(features / self.parameter_scale)
+                    truth = float(np.clip(
+                        agent.capability[domain] - 0.18 * hardness, 0.0, 1.0))
+                    prediction = float(self.theta_quality[agent_id] @ features)
                     errors.append(prediction - truth)
                     relative.append(abs(prediction - truth) / max(truth, 1e-9))
         errors = np.asarray(errors, dtype=float)
@@ -394,19 +518,23 @@ class PaperController:
             lambda o: self.predict_processing(o.agent_id, o.features),
             lambda o: self.predict_waiting(o.features),
             lambda o: self.predict_quality(o.agent_id, o.features),
-            self.cfg.loss,
+            replace(self.cfg.loss, lambda_reg_p=self.ridge_p,
+                    lambda_reg_w=self.ridge_w, lambda_reg_q=self.ridge_q),
             processing_parameters=self.theta_time,
             quality_parameters=self.theta_quality,
+            waiting_parameters=self.theta_wait,
+            processing_reference=self.prior_time, waiting_reference=self.prior_wait,
+            quality_reference=self.prior_quality,
         )
 
     def constraint(self, vector: np.ndarray, budget: float) -> tuple[float, np.ndarray]:
-        time, _, _ = self._split(self.project(vector))
+        time, _, _ = self._split(np.asarray(vector, dtype=float))
         gradient = np.zeros_like(vector)
         observations = list(self.observations)
         if observations:
             predictions = []
             for observation in observations:
-                predictions.append(float(time[observation.agent_id] @ observation.features))
+                predictions.append(float(time[observation.agent_id] @ self.task_features(observation.features)))
                 start = observation.agent_id * self.feature_dim
                 gradient[start:start + self.feature_dim] += observation.features / len(observations)
             violation = float(np.mean(predictions) - budget)
@@ -514,7 +642,16 @@ class ControlledReplayExperiment:
                     for neighbor in ((index - 1) % count, (index + 1) % count):
                         edge_sum += (1.0 / 3.0) * float(np.sum((vector - vectors[neighbor]) ** 2))
             disagreement = 0.25 * edge_sum
+            # The ridge is part of F_j as the manuscript writes it, so it
+            # belongs in Phi.  It is also reported on its own, because a
+            # regulariser large enough to supply strong convexity is large
+            # enough to dominate the number a reader takes for the data fit.
+            ridge_sum = sum(
+                controller.block_regularizer(block_name) for controller in self.controllers
+            )
             metrics[f"local_{short_name}"] = float(local_sum)
+            metrics[f"data_{short_name}"] = float(local_sum - ridge_sum)
+            metrics[f"ridge_{short_name}"] = float(ridge_sum)
             metrics[f"disagreement_{short_name}"] = float(disagreement)
             metrics[f"phi_{short_name}"] = float(local_sum + omega[block_name] * disagreement)
         return metrics
@@ -530,6 +667,9 @@ class ControlledReplayExperiment:
         scores = [c.true_processing_error(self.agents) for c in self.controllers]
         rmse = float(np.mean([value[0] for value in scores]))
         mape = float(np.mean([value[1] for value in scores]))
+        quality = [c.true_quality_error(self.agents) for c in self.controllers]
+        quality_rmse = float(np.mean([value[0] for value in quality]))
+        quality_mape = float(np.mean([value[1] for value in quality]))
         counts = np.zeros((len(self.controllers), len(DOMAIN_ORDER)), dtype=float)
         for row in self.task_records:
             counts[row["controller_id"], DOMAIN_INDEX[row["domain"]]] += 1.0
@@ -542,6 +682,8 @@ class ControlledReplayExperiment:
         return {
             "true_processing_rmse": rmse,
             "true_processing_mape": mape,
+            "true_quality_rmse": quality_rmse,
+            "true_quality_mape": quality_mape,
             "domain_mix_total_variation": float(skew),
         }
 
@@ -577,7 +719,15 @@ class ControlledReplayExperiment:
         base = task.features
         busy_fraction = float(np.mean(self.agent_available > now))
         pending = self._pending_count(now)
-        return np.concatenate((base, [busy_fraction, pending / max(1, self.config.agents)]))
+        # Queue occupancy is saturated at one agent-equivalent.  Without the
+        # cap this coordinate is unbounded under load - it reached 3.8 in a
+        # congested run - which breaks the ||x|| <= 1 bound that the
+        # manuscript's constants M_p, M_w, M_q are derived from.
+        queue_pressure = min(pending / max(1, self.config.agents), 1.0)
+        vector = np.concatenate((base, [busy_fraction, queue_pressure]))
+        if self.config.normalize_features:
+            vector = vector / RAW_FEATURE_NORM
+        return vector
 
     def _proposal(self, controller: PaperController, task: ReplayTask, agent: AgentSpec, now: float) -> CandidateProposal:
         x = self._prediction_features(task, now)
@@ -633,7 +783,8 @@ class ControlledReplayExperiment:
             finish, self._sequence, task.task_id, controller.controller_id,
             proposal.agent_id, proposal.predicted_processing,
             proposal.predicted_wait_budget, proposal.predicted_quality,
-            ridge_penalty(controller.theta_time, self.config.loss.lambda_reg_p),
+            ridge_penalty(controller.theta_time, controller.ridge_p,
+                          controller.prior_time),
             assigned_at, outcome, np.asarray(proposal.feature_vector, dtype=float), buffered,
         ))
 
@@ -751,10 +902,15 @@ class ControlledReplayExperiment:
             disagreement = np.asarray(
                 [row[f"disagreement_{short_name}"] for row in self.round_records], dtype=float
             )
+            data = np.asarray(
+                [row[f"data_{short_name}"] for row in self.round_records], dtype=float
+            )
             network_summary.update({
                 f"phi_{short_name}_auc": float(series.mean()) if len(series) else np.nan,
                 f"phi_{short_name}_final": float(series[-1]) if len(series) else np.nan,
                 f"local_{short_name}_final": float(local[-1]) if len(local) else np.nan,
+                f"data_{short_name}_final": float(data[-1]) if len(data) else np.nan,
+                f"data_{short_name}_auc": float(data.mean()) if len(data) else np.nan,
                 f"disagreement_{short_name}_auc": float(disagreement.mean()) if len(disagreement) else np.nan,
                 f"disagreement_{short_name}_final": float(disagreement[-1]) if len(disagreement) else np.nan,
             })
