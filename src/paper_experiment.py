@@ -308,9 +308,14 @@ class PaperController:
         # coefficient lambda, so the local estimator and the ridge inside the
         # A-SPSA objective are the same regularisation rather than two
         # unrelated ones.  P_0 = 20 I made the prior almost vacuous.
-        self.prior_time = self.theta_time.copy()
-        self.prior_wait = self.theta_wait.copy()
-        self.prior_quality = self.theta_quality.copy()
+        if cfg.loss.ridge_reference == "origin":
+            self.prior_time = np.zeros_like(self.theta_time)
+            self.prior_wait = np.zeros_like(self.theta_wait)
+            self.prior_quality = np.zeros_like(self.theta_quality)
+        else:
+            self.prior_time = self.theta_time.copy()
+            self.prior_wait = self.theta_wait.copy()
+            self.prior_quality = self.theta_quality.copy()
         self.ridge_p = cfg.loss.lambda_reg_p / self.parameter_scale**2
         self.ridge_w = cfg.loss.lambda_reg_w / self.parameter_scale**2
         self.ridge_q = cfg.loss.lambda_reg_q / self.parameter_scale**2

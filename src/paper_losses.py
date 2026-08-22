@@ -38,6 +38,10 @@ class PaperLossConfig:
     #    regularised with lambda >= mu.
     lambda_reg_q: float = 0.002
     lambda_reg_w: float = 0.002
+    # "prior" penalises ||theta - theta_0||^2; "origin" is the manuscript's
+    # literal ||theta||^2.  Same curvature, so the same strong-convexity
+    # modulus; they differ only in what the shrinkage target is.
+    ridge_reference: str = "prior"
 
 
 @dataclass(frozen=True)
