@@ -1,7 +1,7 @@
 # Аудит финального simulated run
 
 Дата прогона: 2026-08-22. Аудируемый каталог: `paper_experiment_outputs_corrected_full`.
-Ревизия кода: `ead00f13da5339fd2ca3c8c23e90e1dac6036c71` (записана в `experiment_manifest.json`).
+Ревизия кода: `e01a7da795c2ec9ea0fac07f8cbd680b48e4016c` (записана в `experiment_manifest.json`, дерево чистое).
 Реальные LLM-вызовы не выполнялись.
 
 **Этот аудит отменяет предыдущий.** Артефакты `paper_experiment_outputs_objective_full_v3`
