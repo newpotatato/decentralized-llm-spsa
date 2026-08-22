@@ -50,10 +50,19 @@ class OptimizerConfig:
     # the manuscript prescription h = 1/max{M, omega*lambda_max} applies
     # directly.  Disable it only to reproduce the raw manuscript recurrence.
     compensate_perturbation_dimension: bool = True
-    # Manuscript initialisation is z_{j,0} = 0.  Because theta_0 is not the
-    # origin for a regression model, that is an implicit shrinkage prior; the
-    # alternative anchors the surrogate at the incoming parameters.
-    surrogate_init: str = "zero"
+    # Centre of the initial quadratic surrogate, phi_0 = phi_0* + (gamma_0/2)
+    # ||theta - z_0||^2.  The manuscript writes z_{j,0} = 0.  In the estimate
+    # sequence the method is built on, the initial gap carried through the
+    # whole analysis is (gamma_0/2)||z_0 - theta*||^2, so z_0 = 0 pays for the
+    # distance from the ORIGIN to the optimum instead of from the starting
+    # point, and is only neutral when theta_0 = 0 as well.  For a regression
+    # model whose parameters are not centred it is an implicit shrinkage prior:
+    # the probe is the convex combination (1 - alpha) theta + alpha z, so with
+    # z pinned near the origin every round multiplies theta by roughly
+    # (1 - alpha).  Anchoring at theta_0 is the standard construction and is
+    # measurably better on all three blocks, so it is the default; "zero"
+    # reproduces the manuscript text exactly.
+    surrogate_init: str = "theta"
 
 
 @dataclass(frozen=True)
