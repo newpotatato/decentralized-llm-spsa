@@ -120,10 +120,15 @@ def main() -> None:
     parser.add_argument("--link-noise", type=float, default=0.0)
     parser.add_argument("--ramp", type=float, default=1.6)
     parser.add_argument("--window", type=int, default=24)
+    parser.add_argument("--train-seeds", type=int, nargs="+", default=[131],
+                        help="seeds averaged inside ONE oracle call; more seeds "
+                             "means a less noisy oracle, which is the condition "
+                             "acceleration theory requires")
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    train_seeds, test_seeds = (131,), (11, 23, 37, 41, 53)
+    train_seeds = tuple(args.train_seeds)
+    test_seeds = (11, 23, 37, 41, 53)
     tasks = load_manifest_tasks(args.manifest, train_seeds[0], args.rho,
                                 make_agent_pool(args.agents), args.limit,
                                 split="train", batch_size=args.batch)
