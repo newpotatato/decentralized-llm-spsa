@@ -94,7 +94,7 @@ class Assignment:
     payload: object = None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class BufferPolicy:
     """Weights of the dynamic scheduling layer.
 
@@ -116,6 +116,21 @@ class BufferPolicy:
     wait_pressure_cap: float = 3.0
     matching: str = "exact"
     epsilon: float = 1e-8
+    # Optional per-domain weights.  When present, a task is scheduled with the
+    # weights of its own domain rather than one global set: a security incident
+    # and a frontend question need not trade deadline risk against suitability
+    # in the same proportion.  Shape (domains, 5), columns in the order
+    # hotness, wait pressure, deadline gap, budget overrun, hotness slope.
+    per_domain: Optional[np.ndarray] = None
+
+    def weights_for(self, domain: Optional[int]) -> tuple[float, float, float, float, float]:
+        """The five priority weights that apply to a task of this domain."""
+        if self.per_domain is None or domain is None:
+            return (self.hotness_weight, self.wait_pressure_weight,
+                    self.deadline_gap_penalty, self.budget_overrun_penalty,
+                    self.hotness_slope)
+        row = np.asarray(self.per_domain)[int(domain)]
+        return (float(row[0]), float(row[1]), float(row[2]), float(row[3]), float(row[4]))
 
     def __post_init__(self) -> None:
         if self.matching not in {"exact", "greedy"}:
@@ -233,11 +248,12 @@ class GlobalAssignmentBuffer:
             # A task is hot when even its best *reachable* execution option has
             # little relative slack.  This term is task-level, so urgency does
             # not distort the ranking of agents for the same task.
+            domain = getattr(task.payload, "domain", None)
+            (w_hot, w_wait, w_gap, w_over, slope) = self.policy.weights_for(domain)
+
             slack_source = reachable or dynamic_rows
             best_slack = max(row.slack_coefficient for row in slack_source)
-            hotness = self._sigmoid(
-                self.policy.hotness_slope * (1.0 - best_slack)
-            )
+            hotness = self._sigmoid(slope * (1.0 - best_slack))
 
             # Waiting pressure uses the controller's published admissible-wait
             # prediction.  It is task-level and never redefines the external
@@ -253,12 +269,10 @@ class GlobalAssignmentBuffer:
                 candidate.wait_pressure = wait_pressure
                 candidate.priority = (
                     candidate.proposal.base_score
-                    + self.policy.hotness_weight * hotness
-                    + self.policy.wait_pressure_weight * wait_pressure
-                    - self.policy.deadline_gap_penalty
-                    * candidate.deadline_gap
-                    - self.policy.budget_overrun_penalty
-                    * max(0.0, candidate.required_time_ratio - 1.0)
+                    + w_hot * hotness
+                    + w_wait * wait_pressure
+                    - w_gap * candidate.deadline_gap
+                    - w_over * max(0.0, candidate.required_time_ratio - 1.0)
                 )
 
     def dispatch(
