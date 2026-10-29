@@ -31,12 +31,59 @@ from .paper_optimizers import (
 DOMAIN_ORDER = tuple(ITSkill)
 DOMAIN_INDEX = {skill.value: index for index, skill in enumerate(DOMAIN_ORDER)}
 DIFFICULTY = {"easy": 0.25, "medium": 0.60, "hard": 1.0}
+TASK_KINDS = ("code_editing", "code_generation", "debugging", "design",
+              "question_answering")
+TASK_KIND_INDEX = {kind: index for index, kind in enumerate(TASK_KINDS)}
+# Complexity indicators, standing in for the manuscript's set I_i.  The pinned
+# manifest carries no prompt text, so the indicators are the structural signals
+# that survive: whether the post contains code, whether it carries many tags,
+# and whether the task kind is one of the two that require reading an existing
+# artefact rather than producing a new one.
+COMPLEXITY_INDICATOR_WEIGHT = 0.6
+HARD_TASK_KINDS = frozenset({"debugging", "design"})
+
+
+def task_complexity(prompt_chars: int, has_code: bool, tag_count: int,
+                    task_kind: str, primary_share: float) -> float:
+    """Manuscript appendix complexity score, normalised to [0, 1].
+
+    ``h_i = clip(2 + 4 phi_{i,type} + 2 min(|s_i|/800, 1.5) + c_i^I, 1, 10)``
+
+    ``phi_{i,type}`` is the share of the task's recognised tags that belong to
+    its primary domain, ``|s_i|`` the prompt length, and ``c_i^I`` the weighted
+    count of complexity indicators.  The three-valued ``difficulty_bucket``
+    proxy it replaces took only the values 0.25, 0.60 and 1.0 and was derived
+    from view counts, so it graded popularity rather than difficulty.
+    """
+    indicators = (int(bool(has_code)) + int(tag_count >= 4)
+                  + int(task_kind in HARD_TASK_KINDS))
+    raw = (2.0
+           + 4.0 * float(primary_share)
+           + 2.0 * min(float(prompt_chars) / 800.0, 1.5)
+           + COMPLEXITY_INDICATOR_WEIGHT * indicators)
+    return float(np.clip(raw, 1.0, 10.0) / 10.0)
+
+
+def length_score(prompt_chars: int) -> float:
+    """Saturating prompt length, the manuscript's ``min(|s_i|/800, 1.5)``."""
+    return float(min(float(prompt_chars) / 800.0, 1.5) / 1.5)
 EPSILON_RELEVANCE = 1e-9
 # Largest attainable norm of the raw feature vector: one active domain
 # indicator plus hardness, busy fraction and queue occupancy, each in [0, 1].
-RAW_FEATURE_NORM = 2.0
+RAW_FEATURE_NORM = float(np.sqrt(6.0))
 # Indices of the coordinates that describe system load rather than the task.
-LOAD_FEATURE_INDICES = (7, 8)
+# The last two coordinates describe system load rather than the task.
+LOAD_FEATURE_INDICES = (len(DOMAIN_ORDER) + 3, len(DOMAIN_ORDER) + 4)
+
+
+def raw_feature_norm(embedding_dim: int = 0, pair_feature: bool = False) -> float:
+    """Largest attainable norm of the raw feature vector.
+
+    A prompt embedding is scaled to norm at most one (``prompt_embeddings``),
+    so it adds one unit to the bound whatever its dimension; the pair quality
+    coordinate lies in [0, 1] and adds one more.
+    """
+    return float(np.sqrt(6.0 + (1.0 if embedding_dim else 0.0) + (1.0 if pair_feature else 0.0)))
 # Raised from 12 so the selected configuration is no longer pinned to the
 # upper boundary of the architecture search grid.
 MAX_AGENTS = 18
@@ -72,6 +119,19 @@ class ReplayTask:
     has_code: bool
     arrival: float
     deadline: float
+    length: float = 0.0
+    task_kind: int = 0
+    # Name of the domain slot.  Empty for the IT benchmark, whose names come
+    # from ``DOMAIN_ORDER``; measured benchmarks bring their own six families.
+    domain_name: str = ""
+    # Low-dimensional prompt embedding, norm at most one.  Empty unless the
+    # experiment sets ``embedding_dim``; it sits between the task covariates
+    # and the load coordinates so the rest of the layout is unchanged.
+    embedding: tuple[float, ...] = ()
+
+    @property
+    def domain_label(self) -> str:
+        return self.domain_name or DOMAIN_ORDER[self.domain].value
 
     @property
     def features(self) -> np.ndarray:
@@ -86,9 +146,13 @@ class ReplayTask:
         The full tag vector is retained on the task and is still what
         ``semantic_relevance`` consumes.
         """
-        out = np.zeros(len(DOMAIN_ORDER) + 1, dtype=float)
+        out = np.zeros(len(DOMAIN_ORDER) + 3, dtype=float)
         out[self.domain] = 1.0
-        out[-1] = self.hardness
+        out[len(DOMAIN_ORDER)] = self.hardness
+        out[len(DOMAIN_ORDER) + 1] = self.length
+        out[len(DOMAIN_ORDER) + 2] = float(self.has_code)
+        if self.embedding:
+            out = np.concatenate((out, np.asarray(self.embedding, dtype=float)))
         return out
 
 
@@ -99,6 +163,9 @@ class AgentSpec:
     capability: np.ndarray
     mean_service: np.ndarray
     token_cost: float
+    # Serving slots of one model share its predictor.  -1 means the agent is a
+    # model of its own, as in the simulated pool.
+    model_id: int = -1
 
 
 @dataclass(frozen=True)
@@ -137,7 +204,18 @@ class ExperimentConfig:
     #              situation the manuscript motivates synchronization with: a
     #              controller never observes the domains it does not route, so
     #              those parameters can only improve through its neighbours.
+    #   "skewed" - each controller owns a domain group but only receives a
+    #              ``specialization`` share of that group's traffic, the rest
+    #              being load balanced.  Disjoint ownership is the extreme case
+    #              in which a neighbour's parameters carry no information about
+    #              a controller's own traffic, only bias; a real deployment sits
+    #              between the two, and that is where the coupling weight of the
+    #              network objective has an interior optimum rather than being
+    #              driven to full agreement or switched off.
     controller_assignment: str = "load"
+    # Share of a domain group's traffic that goes to its owner under the
+    # "skewed" assignment.  0 reproduces "load", 1 reproduces "domain".
+    specialization: float = 0.5
     # Adapt-then-combine synchronisation.  After the local update, each
     # controller replaces its parameters by a convex combination with its ring
     # neighbours:  theta_j <- (1 - 2*eps) theta_j + eps theta_{j-1} + eps
@@ -150,6 +228,11 @@ class ExperimentConfig:
     # of omega*h ~ 1e-4 here, while the combination acts at the scale of the
     # estimate itself.  0 disables it; 1/(controllers) is full averaging.
     diffusion_mixing: float = 0.0
+    # Weights of the controller's base suitability score, previously hard-coded.
+    # Order: predicted quality, semantic relevance, predicted processing time,
+    # token cost.  Exposing them makes the agent-choice half of the policy
+    # tunable, which is what the quality objective acts on.
+    base_score_weights: tuple[float, float, float, float] = (1.10, 0.40, -0.16, -0.08)
     # The manuscript's verification of Assumption 4 sets X_max = Z_max = 1 and
     # derives M_p = X^2/eps_p^2 = 400 from it.  The raw feature vector has
     # ||x|| up to 2, so every constant it states is understated by X_max^2 and
@@ -180,6 +263,33 @@ class ExperimentConfig:
     # local_* and disagreement_* are additionally reported as separate primary
     # endpoints so this coefficient can no longer decide a conclusion alone.
     network_omega: tuple[float, float, float] = (0.002, 0.002, 0.002)
+    # Dimension of the prompt embedding appended to the task covariates.  Zero
+    # reproduces the manuscript feature vector.  Every published router
+    # conditions on the prompt text; domain and hardness alone can only learn
+    # per-family means and cannot tell two prompts of one family apart.
+    embedding_dim: int = 0
+    # Task--agent pair coordinate: the offline estimate of this agent's quality
+    # on this prompt from its nearest train prompts (``TableOracle.prior_quality``).
+    # The manuscript defines the controller features on the pair, f_ik; the
+    # original implementation carried task features only, so the controller
+    # could not tell two prompts of one family apart while the kNN baseline it
+    # is compared against could.  Off by default.
+    pair_quality_feature: bool = False
+    # Upper clipping bounds of the processing and waiting predictors, in time
+    # units.  They suit the simulated service times of order one; measured
+    # reasoning-model latencies run to tens of minutes and need wider bounds,
+    # or the predictor cannot represent the tail the scheduler must plan for.
+    max_processing_units: float = 20.0
+    max_waiting_units: float = 30.0
+    # Initialise the processing and quality predictors from the agents' offline
+    # profile (per-domain mean service and quality) instead of the generic
+    # constants.  Measured-outcome runs set it: the profile is what an operator
+    # knows from offline evaluation, the same train data the kNN and per-domain
+    # baselines use.
+    profile_prior: bool = False
+    # Which tasks the global buffer serves first: the weighted priority of
+    # ``BufferPolicy`` or one of the classic rules "edf", "llf", "sjf".
+    buffer_order: str = "weighted"
 
     def __post_init__(self) -> None:
         if self.controllers <= 0 or self.agents <= 0:
@@ -193,16 +303,21 @@ class ExperimentConfig:
             raise ValueError("optimizer_blocks must select processing/waiting/quality")
         if len(self.network_omega) != 3 or any(weight < 0.0 for weight in self.network_omega):
             raise ValueError("network_omega must contain three non-negative coefficients")
-        if self.controller_assignment not in {"load", "domain"}:
-            raise ValueError("controller_assignment must be load or domain")
+        if self.controller_assignment not in {"load", "domain", "skewed"}:
+            raise ValueError("controller_assignment must be load, domain or skewed")
+        if not 0.0 <= self.specialization <= 1.0:
+            raise ValueError("specialization must lie in [0, 1]")
         if not 0.0 <= self.diffusion_mixing <= 0.5:
             raise ValueError("diffusion_mixing must lie in [0, 0.5]")
         if self.architecture not in {
             "legacy_local_queue", "random", "static_skill", "shortest_queue",
             "global_greedy", "global_exact", "centralized_exact", "oracle",
-            "fixed_replay",
+            "fixed_replay", "static_domain", "quality_greedy", "cost_greedy",
+            "knn_router", "mlp_router",
         }:
             raise ValueError(f"unknown architecture: {self.architecture}")
+        if self.buffer_order not in BufferPolicy.ORDERS:
+            raise ValueError(f"buffer_order must be one of {BufferPolicy.ORDERS}")
 
 
 @dataclass(order=True)
@@ -274,6 +389,25 @@ def pool_capacity(agents: list[AgentSpec]) -> float:
     return float(sum(1.0 / float(np.mean(agent.mean_service)) for agent in agents))
 
 
+# How strongly each domain's outcome responds to complexity and to prompt
+# length.  A single shared slope, as the earlier oracle used, makes the optimal
+# predictor identical for every controller no matter which domains it sees: the
+# coefficient of a domain is a property of the agent, so a controller that only
+# handles ML/LLM estimates the same number a controller handling everything
+# would.  Domain-specific responses break that.  Debugging a long trace scales
+# with the log; generating code from a short prompt does not, and an ML job hits
+# memory limits that a frontend question never reaches.
+#
+# The predictors carry one complexity coefficient and one length coefficient per
+# agent, not one per (agent, domain), so no single parameter vector fits every
+# domain at once.  The best fit therefore depends on the domain mix a controller
+# actually sees, which is what makes the sites genuinely heterogeneous - and
+# what costs the common minimiser of Assumption 3.
+DOMAIN_COMPLEXITY_RESPONSE = (0.35, 0.55, 0.80, 1.35, 1.00, 0.65)
+DOMAIN_LENGTH_RESPONSE = (0.45, 0.30, 0.20, 0.10, 0.35, 0.55)
+DOMAIN_QUALITY_RESPONSE = (0.10, 0.14, 0.20, 0.32, 0.24, 0.16)
+
+
 class ReplayOracle:
     def __init__(self, seed: int, agents: list[AgentSpec]):
         self.seed = int(seed)
@@ -282,10 +416,16 @@ class ReplayOracle:
     def outcome(self, task: ReplayTask, agent_id: int) -> PotentialOutcome:
         agent = self.agents[agent_id]
         rng = _stable_rng(self.seed, task.source_id, agent_id, "outcome")
-        mean = float(agent.mean_service[task.domain]) * (1.0 + 0.70 * task.hardness)
+        response = DOMAIN_COMPLEXITY_RESPONSE[task.domain]
+        length_response = DOMAIN_LENGTH_RESPONSE[task.domain]
+        mean = float(agent.mean_service[task.domain]) * (
+            1.0 + response * task.hardness + length_response * task.length
+        )
         service = max(0.05, mean * float(rng.lognormal(mean=-0.5 * 0.22**2, sigma=0.22)))
         quality = float(np.clip(
-            agent.capability[task.domain] - 0.18 * task.hardness + rng.normal(0.0, 0.045),
+            agent.capability[task.domain]
+            - DOMAIN_QUALITY_RESPONSE[task.domain] * task.hardness
+            + rng.normal(0.0, 0.045),
             0.0, 1.0,
         ))
         success_probability = float(np.clip(0.10 + 0.90 * quality, 0.0, 1.0))
@@ -300,23 +440,53 @@ class PaperController:
         self.controller_id = controller_id
         self.agents = agents
         self.cfg = cfg
-        # six domain coordinates + hardness + busy fraction + buffer pressure
-        self.feature_dim = len(DOMAIN_ORDER) + 3
+        # six domain coordinates + complexity + length + code flag
+        # + busy fraction + buffer pressure
+        self.feature_dim = (len(DOMAIN_ORDER) + 5 + cfg.embedding_dim
+                            + (1 if cfg.pair_quality_feature else 0))
+        self.load_indices = (self.feature_dim - 2, self.feature_dim - 1)
+        # The pair coordinate sits just before the two load coordinates.
+        self.pair_index = self.feature_dim - 3 if cfg.pair_quality_feature else None
+        # Predictor row of every agent.  Slots of one model are capacity, not
+        # distinct predictors: learning a separate vector per slot splits one
+        # model's feedback across its replicas and leaves each near the prior.
+        self.row_of = np.array([a.model_id if a.model_id >= 0 else a.agent_id for a in agents])
+        self.rows = int(self.row_of.max()) + 1
+        if sorted(set(self.row_of.tolist())) != list(range(self.rows)):
+            raise ValueError("model ids must be contiguous from zero")
         # Scaling the features by RAW_FEATURE_NORM is a change of units, so the
         # initial parameters and the feasible box must be expressed in the same
         # units or every prediction is off by exactly that factor.
-        self.parameter_scale = RAW_FEATURE_NORM if cfg.normalize_features else 1.0
+        self.parameter_scale = (raw_feature_norm(cfg.embedding_dim, cfg.pair_quality_feature)
+                                if cfg.normalize_features else 1.0)
         unit = self.parameter_scale
-        self.theta_time = np.zeros((len(agents), self.feature_dim))
+        self.theta_time = np.zeros((self.rows, self.feature_dim))
         self.theta_time[:, :len(DOMAIN_ORDER)] = 1.6 * unit
-        self.theta_time[:, len(DOMAIN_ORDER)] = 1.0 * unit
+        self.theta_time[:, len(DOMAIN_ORDER)] = 1.0 * unit       # complexity
+        self.theta_time[:, len(DOMAIN_ORDER) + 1] = 0.4 * unit   # length
+        self.theta_time[:, len(DOMAIN_ORDER) + 2] = 0.1 * unit   # has code
         self.theta_wait = np.zeros(self.feature_dim)
         self.theta_wait[:len(DOMAIN_ORDER)] = 0.20 * unit
         self.theta_wait[len(DOMAIN_ORDER)] = 0.20 * unit
         self.theta_wait[-2:] = (1.0 * unit, 0.5 * unit)
-        self.theta_quality = np.zeros((len(agents), self.feature_dim))
+        self.theta_quality = np.zeros((self.rows, self.feature_dim))
         self.theta_quality[:, :len(DOMAIN_ORDER)] = 0.62 * unit
-        self.theta_quality[:, len(DOMAIN_ORDER)] = -0.12 * unit
+        self.theta_quality[:, len(DOMAIN_ORDER)] = -0.12 * unit      # complexity
+        self.theta_quality[:, len(DOMAIN_ORDER) + 1] = -0.02 * unit  # length
+        self.theta_quality[:, len(DOMAIN_ORDER) + 2] = 0.0           # has code
+        if cfg.profile_prior:
+            first = {}
+            for agent, row in zip(agents, self.row_of):
+                first.setdefault(int(row), agent)
+            for row, agent in first.items():
+                self.theta_time[row] = 0.0
+                self.theta_time[row, :len(DOMAIN_ORDER)] = np.asarray(agent.mean_service) * unit
+                self.theta_quality[row] = 0.0
+                if self.pair_index is not None:
+                    # Start from the offline per-prompt estimate itself.
+                    self.theta_quality[row, self.pair_index] = 1.0 * unit
+                else:
+                    self.theta_quality[row, :len(DOMAIN_ORDER)] = np.asarray(agent.capability) * unit
         # Recursive least squares started at theta_0 with covariance P_0 =
         # (1/lambda) I is exactly ridge regression about theta_0 with
         # coefficient lambda, so the local estimator and the ridge inside the
@@ -335,9 +505,9 @@ class PaperController:
         self.ridge_q = cfg.loss.lambda_reg_q / self.parameter_scale**2
         prior_strength = max(cfg.rls_prior_strength, 1e-9) / self.parameter_scale**2
         covariance = np.eye(self.feature_dim) / prior_strength
-        self.p_time = np.stack([covariance.copy() for _ in agents])
+        self.p_time = np.stack([covariance.copy() for _ in range(self.rows)])
         self.p_wait = covariance.copy()
-        self.p_quality = np.stack([covariance.copy() for _ in agents])
+        self.p_quality = np.stack([covariance.copy() for _ in range(self.rows)])
         self.observations: deque[LossObservation] = deque(maxlen=cfg.history_size)
         self.active_tasks = 0
 
@@ -352,19 +522,29 @@ class PaperController:
         if not self.cfg.load_features_for_waiting_only:
             return features
         masked = np.asarray(features, dtype=float).copy()
-        masked[list(LOAD_FEATURE_INDICES)] = 0.0
+        masked[list(self.load_indices)] = 0.0
         return masked
 
     def predict_processing(self, agent_id: int, features: np.ndarray) -> float:
         x = self.task_features(features)
-        return float(np.clip(self.theta_time[agent_id] @ x, 0.05, 20.0))
+        return float(np.clip(self.theta_time[self.row_of[agent_id]] @ x, 0.05,
+                             self.cfg.max_processing_units))
+
+    def wait_features(self, features: np.ndarray) -> np.ndarray:
+        """Waiting is a task-level quantity; the pair coordinate is masked."""
+        if self.pair_index is None:
+            return features
+        masked = np.asarray(features, dtype=float).copy()
+        masked[self.pair_index] = 0.0
+        return masked
 
     def predict_waiting(self, features: np.ndarray) -> float:
-        return float(np.clip(self.theta_wait @ features, 0.0, 30.0))
+        return float(np.clip(self.theta_wait @ self.wait_features(features), 0.0,
+                             self.cfg.max_waiting_units))
 
     def predict_quality(self, agent_id: int, features: np.ndarray) -> float:
         x = self.task_features(features)
-        return float(np.clip(self.theta_quality[agent_id] @ x, 0.0, 1.0))
+        return float(np.clip(self.theta_quality[self.row_of[agent_id]] @ x, 0.0, 1.0))
 
     @staticmethod
     def _rls(theta: np.ndarray, covariance: np.ndarray, x: np.ndarray, target: float, forgetting: float = 0.99):
@@ -378,13 +558,13 @@ class PaperController:
         self.observations.append(observation)
         if not self.cfg.use_rls:
             return
-        aid, x = observation.agent_id, observation.features
+        aid, x = self.row_of[observation.agent_id], observation.features
         task_only = self.task_features(x)
         self.theta_time[aid], self.p_time[aid] = self._rls(
             self.theta_time[aid], self.p_time[aid], task_only, observation.processing_real
         )
         self.theta_wait, self.p_wait = self._rls(
-            self.theta_wait, self.p_wait, x, observation.waiting_real
+            self.theta_wait, self.p_wait, self.wait_features(x), observation.waiting_real
         )
         self.theta_quality[aid], self.p_quality[aid] = self._rls(
             self.theta_quality[aid], self.p_quality[aid], task_only, observation.quality_real
@@ -395,14 +575,14 @@ class PaperController:
         return np.concatenate((self.theta_time.ravel(), self.theta_wait, self.theta_quality.ravel()))
 
     def _split(self, vector: np.ndarray):
-        matrix_size = len(self.agents) * self.feature_dim
-        time = vector[:matrix_size].reshape(len(self.agents), self.feature_dim)
+        matrix_size = self.rows * self.feature_dim
+        time = vector[:matrix_size].reshape(self.rows, self.feature_dim)
         wait = vector[matrix_size:matrix_size + self.feature_dim]
-        quality = vector[matrix_size + self.feature_dim:].reshape(len(self.agents), self.feature_dim)
+        quality = vector[matrix_size + self.feature_dim:].reshape(self.rows, self.feature_dim)
         return time, wait, quality
 
     def parameter_blocks(self) -> tuple[tuple[str, slice], ...]:
-        matrix_size = len(self.agents) * self.feature_dim
+        matrix_size = self.rows * self.feature_dim
         return (
             ("processing", slice(0, matrix_size)),
             ("waiting", slice(matrix_size, matrix_size + self.feature_dim)),
@@ -433,14 +613,15 @@ class PaperController:
         time, wait, quality = self._split(np.asarray(vector, dtype=float))
         observations = list(self.observations)
         if block_name == "processing":
-            values = [processing_loss(float(time[o.agent_id] @ self.task_features(o.features)), o, self.cfg.loss)
+            values = [processing_loss(float(time[self.row_of[o.agent_id]] @ self.task_features(o.features)), o, self.cfg.loss)
                       for o in observations]
             regularizer = ridge_penalty(time, self.ridge_p, self.prior_time)
         elif block_name == "waiting":
-            values = [waiting_loss(float(wait @ o.features), o, self.cfg.loss) for o in observations]
+            values = [waiting_loss(float(wait @ self.wait_features(o.features)), o, self.cfg.loss)
+                      for o in observations]
             regularizer = ridge_penalty(wait, self.ridge_w, self.prior_wait)
         elif block_name == "quality":
-            values = [quality_loss(float(quality[o.agent_id] @ self.task_features(o.features)), o, self.cfg.loss)
+            values = [quality_loss(float(quality[self.row_of[o.agent_id]] @ self.task_features(o.features)), o, self.cfg.loss)
                       for o in observations]
             regularizer = ridge_penalty(quality, self.ridge_q, self.prior_quality)
         else:
@@ -454,8 +635,8 @@ class PaperController:
         unit = self.parameter_scale
         time, wait, quality = self._split(np.asarray(vector, dtype=float))
         return np.concatenate((
-            np.clip(time, -5.0 * unit, 20.0 * unit).ravel(),
-            np.clip(wait, -10.0 * unit, 30.0 * unit),
+            np.clip(time, -5.0 * unit, self.cfg.max_processing_units * unit).ravel(),
+            np.clip(wait, -10.0 * unit, self.cfg.max_waiting_units * unit),
             np.clip(quality, -2.0 * unit, 2.0 * unit).ravel(),
         ))
 
@@ -470,9 +651,9 @@ class PaperController:
         time, wait, quality = self._split(np.asarray(vector, dtype=float))
         f1, f2, f3 = mean_losses(
             list(self.observations),
-            lambda o: float(time[o.agent_id] @ self.task_features(o.features)),
-            lambda o: float(wait @ o.features),
-            lambda o: float(quality[o.agent_id] @ self.task_features(o.features)),
+            lambda o: float(time[self.row_of[o.agent_id]] @ self.task_features(o.features)),
+            lambda o: float(wait @ self.wait_features(o.features)),
+            lambda o: float(quality[self.row_of[o.agent_id]] @ self.task_features(o.features)),
             replace(self.cfg.loss, lambda_reg_p=self.ridge_p,
                     lambda_reg_w=self.ridge_w, lambda_reg_q=self.ridge_q),
             processing_parameters=time, quality_parameters=quality,
@@ -502,8 +683,10 @@ class PaperController:
                     # probe must be too or every prediction is off by exactly
                     # the scale factor.
                     features = self.task_features(features / self.parameter_scale)
-                    truth = float(agent.mean_service[domain]) * (1.0 + 0.70 * hardness)
-                    prediction = float(self.theta_time[agent_id] @ features)
+                    truth = float(agent.mean_service[domain]) * (
+                        1.0 + DOMAIN_COMPLEXITY_RESPONSE[domain] * hardness
+                    )
+                    prediction = float(self.theta_time[self.row_of[agent_id]] @ features)
                     errors.append(prediction - truth)
                     relative.append(abs(prediction - truth) / max(truth, 1e-9))
         errors = np.asarray(errors, dtype=float)
@@ -524,8 +707,9 @@ class PaperController:
                     features[len(DOMAIN_ORDER)] = hardness
                     features = self.task_features(features / self.parameter_scale)
                     truth = float(np.clip(
-                        agent.capability[domain] - 0.18 * hardness, 0.0, 1.0))
-                    prediction = float(self.theta_quality[agent_id] @ features)
+                        agent.capability[domain]
+                        - DOMAIN_QUALITY_RESPONSE[domain] * hardness, 0.0, 1.0))
+                    prediction = float(self.theta_quality[self.row_of[agent_id]] @ features)
                     errors.append(prediction - truth)
                     relative.append(abs(prediction - truth) / max(truth, 1e-9))
         errors = np.asarray(errors, dtype=float)
@@ -553,8 +737,8 @@ class PaperController:
         if observations:
             predictions = []
             for observation in observations:
-                predictions.append(float(time[observation.agent_id] @ self.task_features(observation.features)))
-                start = observation.agent_id * self.feature_dim
+                predictions.append(float(time[self.row_of[observation.agent_id]] @ self.task_features(observation.features)))
+                start = self.row_of[observation.agent_id] * self.feature_dim
                 gradient[start:start + self.feature_dim] += observation.features / len(observations)
             violation = float(np.mean(predictions) - budget)
         else:
@@ -602,28 +786,64 @@ def load_manifest_tasks(
             # Keep the expected offered load per task while exposing a burst
             # workload in which multi-task assignment is identifiable.
             arrival += float(rng.exponential(batch_size / arrival_rate))
-        hardness = DIFFICULTY[str(row["difficulty_bucket"])]
+        tags = row.get("tags") or []
+        skill = tuple(float(x) for x in row["skill_vector"])
+        primary_share = 1.0 / max(sum(skill), 1.0)
+        hardness = task_complexity(
+            int(row["prompt_chars"]), bool(row["has_code"]), len(tags),
+            str(row["task_kind"]), primary_share,
+        )
         urgency = float(np.clip(0.15 + 0.60 * hardness + rng.uniform(0.0, 0.20), 0.0, 1.0))
         sla = canonical_service * (1.8 + 1.4 * hardness)
         tasks.append(ReplayTask(
             index, str(row["id"]), DOMAIN_INDEX[str(row["primary_skill"])],
-            tuple(float(x) for x in row["skill_vector"]), hardness, urgency,
+            skill, hardness, urgency,
             int(row["prompt_chars"]), bool(row["has_code"]), arrival, arrival + sla,
+            length_score(int(row["prompt_chars"])),
+            TASK_KIND_INDEX.get(str(row["task_kind"]), 0),
         ))
     return tasks
 
 
 class ControlledReplayExperiment:
-    def __init__(self, tasks: list[ReplayTask], config: ExperimentConfig):
+    def __init__(self, tasks: list[ReplayTask], config: ExperimentConfig,
+                 agents: list[AgentSpec] | None = None, oracle=None):
+        """``agents`` and ``oracle`` default to the simulated pool.
+
+        Passing a ``table_oracle.TableOracle`` and its agents replays measured
+        LLM outcomes through the identical architecture and optimizers.
+        """
         self.tasks = tasks
         self.config = config
-        self.agents = make_agent_pool(config.agents)
-        self.oracle = ReplayOracle(config.seed, self.agents)
+        self.agents = agents if agents is not None else make_agent_pool(config.agents)
+        if len(self.agents) != config.agents:
+            raise ValueError("config.agents must equal the number of agents supplied")
+        self.oracle = oracle if oracle is not None else ReplayOracle(config.seed, self.agents)
+        if any(len(task.embedding) != config.embedding_dim for task in tasks):
+            raise ValueError("every task embedding must have config.embedding_dim coordinates")
+        self.feature_norm = raw_feature_norm(config.embedding_dim, config.pair_quality_feature)
+        if config.pair_quality_feature and not hasattr(self.oracle, "prior_quality"):
+            raise ValueError("pair_quality_feature needs an oracle with prior_quality")
         self.controllers = [PaperController(i, self.agents, config) for i in range(config.controllers)]
         matching = "greedy" if config.architecture == "global_greedy" else "exact"
-        self.buffer = GlobalAssignmentBuffer(BufferPolicy(matching=matching))
+        self.buffer = GlobalAssignmentBuffer(BufferPolicy(matching=matching, order=config.buffer_order))
         optimizer_method = "aspsa" if config.optimizer in {"none", "local_rls"} else config.optimizer
         block_configs = config.optimizer_configs.as_dict() if config.optimizer_configs else {}
+        # The manuscript has one omega per block: it weights the disagreement
+        # term of Phi and it is the coefficient the descent step applies.  The
+        # code had two independent names for it - ``network_omega``, used to
+        # report Phi, and ``OptimizerConfig.consensus_weight``, used by the
+        # algorithm - whose defaults differed by a factor of twenty, so the
+        # objective that was reported was not the one being minimised.  The
+        # driver in run_paper_experiments set both to the same number and was
+        # unaffected; a config built directly from the defaults was not.
+        # ``network_omega`` is now authoritative for both.
+        block_configs = {
+            name: replace(block_configs.get(name, config.optimizer_config),
+                          consensus_weight=omega)
+            for name, omega in zip(("processing", "waiting", "quality"),
+                                   config.network_omega)
+        }
         self.optimizer = DistributedZerothOrderOptimizer(
             optimizer_method, config.optimizer_config, config.seed + 701,
             block_configs=block_configs, active_blocks=config.optimizer_blocks,
@@ -631,6 +851,9 @@ class ControlledReplayExperiment:
         self.agent_available = np.zeros(config.agents, dtype=float)
         self.agent_busy = np.zeros(config.agents, dtype=float)
         self.controller_cursor = 0
+        # Routing draws are kept on their own stream so that changing the
+        # specialization share does not shift the service-time or quality noise.
+        self.routing_rng = _stable_rng(config.seed, "routing")
         self.completions: list[_Completion] = []
         self.task_records: list[dict] = []
         self.round_records: list[dict] = []
@@ -683,15 +906,18 @@ class ControlledReplayExperiment:
         load-based assignment it reflects finite-sample noise only; under
         domain ownership it is the designed heterogeneity.
         """
-        scores = [c.true_processing_error(self.agents) for c in self.controllers]
-        rmse = float(np.mean([value[0] for value in scores]))
-        mape = float(np.mean([value[1] for value in scores]))
-        quality = [c.true_quality_error(self.agents) for c in self.controllers]
-        quality_rmse = float(np.mean([value[0] for value in quality]))
-        quality_mape = float(np.mean([value[1] for value in quality]))
+        if hasattr(self.oracle, "potential"):
+            rmse, mape, quality_rmse, quality_mape = self._counterfactual_errors()
+        else:
+            scores = [c.true_processing_error(self.agents) for c in self.controllers]
+            rmse = float(np.mean([value[0] for value in scores]))
+            mape = float(np.mean([value[1] for value in scores]))
+            quality = [c.true_quality_error(self.agents) for c in self.controllers]
+            quality_rmse = float(np.mean([value[0] for value in quality]))
+            quality_mape = float(np.mean([value[1] for value in quality]))
         counts = np.zeros((len(self.controllers), len(DOMAIN_ORDER)), dtype=float)
         for row in self.task_records:
-            counts[row["controller_id"], DOMAIN_INDEX[row["domain"]]] += 1.0
+            counts[row["controller_id"], row["domain_index"]] += 1.0
         totals = counts.sum(axis=1, keepdims=True)
         mixes = counts / np.maximum(totals, 1.0)
         skew = 0.0
@@ -706,16 +932,138 @@ class ControlledReplayExperiment:
             "domain_mix_total_variation": float(skew),
         }
 
+    def _counterfactual_predictions(self, tasks: list[ReplayTask]):
+        """Every controller's predictions for every task--agent pair of ``tasks``.
+
+        Load coordinates are zero, as in the synthetic probe.  With the pair
+        feature the agent's offline estimate enters its own coordinate.
+        """
+        pair = self.config.pair_quality_feature
+        features = np.stack([
+            np.concatenate((task.features, [0.0] if pair else [], [0.0, 0.0])) for task in tasks
+        ])
+        scale = self.feature_norm if self.config.normalize_features else 1.0
+        features = features / scale
+        if pair:
+            prior = np.array([[self.oracle.prior_quality(task, agent.agent_id) for agent in self.agents]
+                              for task in tasks]) / scale
+        times, qualities = [], []
+        for controller in self.controllers:
+            x = np.stack([controller.task_features(row) for row in features])
+            time = (x @ controller.theta_time.T)[:, controller.row_of]
+            quality = (x @ controller.theta_quality.T)[:, controller.row_of]
+            if pair:
+                k = controller.pair_index
+                time = time + prior * controller.theta_time[controller.row_of, k][None, :]
+                quality = quality + prior * controller.theta_quality[controller.row_of, k][None, :]
+            times.append(np.clip(time, 0.05, self.config.max_processing_units))
+            qualities.append(np.clip(quality, 0.0, 1.0))
+        return times, qualities
+
+    def _own_traffic_quality_rmse(self) -> float:
+        """Quality error of each controller on the tasks it actually routed.
+
+        A controller only routes its own traffic, so under domain-skewed
+        assignment scoring it on every domain rewards averaging with neighbours
+        automatically (RAZBOR 8.6).  Weighted by the number of tasks routed.
+        """
+        errors, weights = [], []
+        by_id = {task.source_id: task for task in self.tasks}
+        for controller in self.controllers:
+            own = [by_id[row["task_id"]] for row in self.task_records
+                   if row["controller_id"] == controller.controller_id]
+            if not own:
+                continue
+            index = self.controllers.index(controller)
+            _, quality = self._counterfactual_predictions(own)
+            truth = self.oracle.potential(own)["quality"]
+            errors.append(float(np.sqrt(np.mean((quality[index] - truth) ** 2))))
+            weights.append(len(own))
+        return float(np.average(errors, weights=weights)) if errors else float("nan")
+
+    def _counterfactual_errors(self) -> tuple[float, float, float, float]:
+        """Prediction error against measured outcomes of every task--agent pair.
+
+        With a measured table there is no generative formula to compare with,
+        but there is something better: the outcome every agent actually
+        produced on every task of the stream, including the pairs that were
+        never dispatched.  Load coordinates are zero, as in the synthetic probe.
+        The quality "MAPE" slot carries the mean absolute error, because
+        measured quality is often exactly zero.
+        """
+        potential = self.oracle.potential(self.tasks)
+        time_pred, quality_pred = self._counterfactual_predictions(self.tasks)
+        stats = []
+        for time, quality in zip(time_pred, quality_pred):
+            time_error = time - potential["service"]
+            quality_error = quality - potential["quality"]
+            stats.append((
+                float(np.sqrt(np.mean(time_error**2))),
+                float(np.mean(np.abs(time_error) / np.maximum(potential["service"], 1e-9))),
+                float(np.sqrt(np.mean(quality_error**2))),
+                float(np.mean(np.abs(quality_error))),
+            ))
+        return tuple(float(v) for v in np.mean(stats, axis=0))
+
+    def _routing_references(self) -> dict[str, float]:
+        """Where the realised operating point sits among the pool's references.
+
+        Reference points are computed on exactly the tasks of this stream from
+        their full counterfactual rows, so they share the stream's composition:
+        the per-task oracle, the best single model and the cheapest single model
+        (both chosen on the train profile, as a deployer would), and the
+        uniform-random expectation.  ``quality_gap_recovered`` is the share of
+        the gap between the best single model and the oracle that the system
+        closed, the quantity RouterBench and RouteLLM report.  The single-model
+        references ignore queueing: they are what one model would score with
+        unlimited capacity.
+        """
+        potential = self.oracle.potential(self.tasks)
+        quality, cost = potential["quality"], potential["cost"]
+        profile = np.array([np.mean(agent.capability) for agent in self.agents])
+        price = np.array([agent.token_cost for agent in self.agents])
+        best, cheapest = int(np.argmax(profile)), int(np.argmin(price))
+        realised_q = float(np.mean([row["quality_real"] for row in self.task_records]))
+        realised_c = float(np.mean([row["cost"] for row in self.task_records]))
+        oracle_q = float(quality.max(axis=1).mean())
+        # Among the agents reaching the best quality, the oracle takes the cheapest.
+        top = quality >= quality.max(axis=1, keepdims=True) - 1e-12
+        oracle_c = float(np.where(top, cost, np.inf).min(axis=1).mean())
+        best_q, best_c = float(quality[:, best].mean()), float(cost[:, best].mean())
+        gap = oracle_q - best_q
+        reference = (self.oracle.reference_summary(self.tasks)
+                     if hasattr(self.oracle, "reference_summary") else {})
+        return {
+            **reference,
+            "oracle_quality": oracle_q, "oracle_cost_usd": oracle_c,
+            "best_single_quality": best_q, "best_single_cost_usd": best_c,
+            "cheapest_single_quality": float(quality[:, cheapest].mean()),
+            "cheapest_single_cost_usd": float(cost[:, cheapest].mean()),
+            "random_quality": float(quality.mean()), "random_cost_usd": float(cost.mean()),
+            "quality_gap_recovered": float((realised_q - best_q) / gap) if gap > 1e-12 else float("nan"),
+            "quality_regret": float(oracle_q - realised_q),
+            "cost_ratio_vs_best_single": float(realised_c / best_c) if best_c > 0 else float("nan"),
+        }
+
     def _controller_for(self, task: ReplayTask) -> PaperController:
         if self.config.architecture in {"oracle", "centralized_exact"} or self.config.controllers == 1:
             return self.controllers[0]
+        owner = self.controllers[
+            (task.domain * self.config.controllers) // len(DOMAIN_ORDER)
+        ]
         if self.config.controller_assignment == "domain":
             # Disjoint domain ownership: the six domains are split as evenly as
             # possible across the controllers, so each one observes only its
             # own slice of the workload.
-            controller = self.controllers[
-                (task.domain * self.config.controllers) // len(DOMAIN_ORDER)
-            ]
+            controller = owner
+        elif self.config.controller_assignment == "skewed":
+            # Partial ownership.  The draw uses the experiment's routing stream
+            # so that the realised mix is reproducible for a given seed.
+            if self.routing_rng.random() < self.config.specialization:
+                controller = owner
+            else:
+                controller = min(self.controllers,
+                                 key=lambda c: (c.active_tasks, c.controller_id))
         else:
             controller = min(self.controllers, key=lambda c: (c.active_tasks, c.controller_id))
         controller.active_tasks += 1
@@ -743,17 +1091,45 @@ class ControlledReplayExperiment:
         # congested run - which breaks the ||x|| <= 1 bound that the
         # manuscript's constants M_p, M_w, M_q are derived from.
         queue_pressure = min(pending / max(1, self.config.agents), 1.0)
-        vector = np.concatenate((base, [busy_fraction, queue_pressure]))
+        pair = [0.0] if self.config.pair_quality_feature else []
+        vector = np.concatenate((base, pair, [busy_fraction, queue_pressure]))
         if self.config.normalize_features:
-            vector = vector / RAW_FEATURE_NORM
+            vector = vector / self.feature_norm
         return vector
 
-    def _proposal(self, controller: PaperController, task: ReplayTask, agent: AgentSpec, now: float) -> CandidateProposal:
-        x = self._prediction_features(task, now)
-        p_hat = controller.predict_processing(agent.agent_id, x)
-        w_hat = controller.predict_waiting(x)
-        q_hat = controller.predict_quality(agent.agent_id, x)
-        relevance = semantic_relevance(task.skill_vector, agent.capability)
+    def _proposal(self, controller: PaperController, task: ReplayTask, agent: AgentSpec, now: float,
+                  shared: dict | None = None) -> CandidateProposal:
+        """One candidate edge.
+
+        ``shared`` caches, for one task at one instant, what does not depend on
+        the individual agent: the feature vector and waiting prediction, and
+        per predictor row the processing and quality predictions and the
+        relevance.  Slots of one model share a row, so a sixteen-slot pool
+        computes each prediction once instead of sixteen times.  The values are
+        identical to computing them per agent.
+        """
+        if shared is None:
+            shared = {}
+        if "x" not in shared:
+            x = self._prediction_features(task, now)
+            shared["x"], shared["x_tuple"] = x, tuple(x)
+            shared["w_hat"] = controller.predict_waiting(x)
+        x, w_hat = shared["x"], shared["w_hat"]
+        row = int(controller.row_of[agent.agent_id])
+        if row not in shared:
+            x_pair, x_pair_tuple = x, shared["x_tuple"]
+            if controller.pair_index is not None:
+                x_pair = x.copy()
+                scale = self.feature_norm if self.config.normalize_features else 1.0
+                x_pair[controller.pair_index] = self.oracle.prior_quality(task, agent.agent_id) / scale
+                x_pair_tuple = tuple(x_pair)
+            shared[row] = (
+                controller.predict_processing(agent.agent_id, x_pair),
+                controller.predict_quality(agent.agent_id, x_pair),
+                semantic_relevance(task.skill_vector, agent.capability),
+                x_pair_tuple,
+            )
+        p_hat, q_hat, relevance, pair_tuple = shared[row]
         if self.config.architecture == "oracle":
             outcome = self.oracle.outcome(task, agent.agent_id)
             base = 1.35 * outcome.quality + 0.45 * float(outcome.success) - 0.12 * outcome.service_time - 0.10 * outcome.cost
@@ -764,17 +1140,41 @@ class ControlledReplayExperiment:
             base = relevance
         elif self.config.architecture == "shortest_queue":
             base = -float(self.agent_available[agent.agent_id])
+        elif self.config.architecture == "static_domain":
+            # Best model per task family from offline evaluation: the
+            # per-category lookup router every routing benchmark reports.
+            base = float(agent.capability[task.domain])
+        elif self.config.architecture == "quality_greedy":
+            # Task-agnostic: the best model overall whenever it is free.
+            base = float(np.mean(agent.capability))
+        elif self.config.architecture == "cost_greedy":
+            base = -float(agent.token_cost)
+        elif self.config.architecture == "knn_router":
+            # RouterBench's kNN router: mean quality of the agent's model over
+            # the nearest train prompts, traded against price with the same
+            # weights the controllers use, so a cost sweep moves both alike.
+            w_q, _, _, w_c = self.config.base_score_weights
+            base = w_q * self.oracle.knn_quality(task, agent.agent_id) + w_c * agent.token_cost
+        elif self.config.architecture == "mlp_router":
+            # A trained router: an MLP on the prompt embedding predicts every
+            # model's quality (RouterBench's MLP router), traded against price
+            # with the same weights as the kNN router.
+            w_q, _, _, w_c = self.config.base_score_weights
+            base = w_q * self.oracle.router_quality(task, agent.agent_id) + w_c * agent.token_cost
         else:
-            base = 1.10 * q_hat + 0.40 * relevance - 0.16 * p_hat - 0.08 * agent.token_cost
+            w_q, w_r, w_p, w_c = self.config.base_score_weights
+            base = (w_q * q_hat + w_r * relevance
+                    + w_p * p_hat + w_c * agent.token_cost)
         return CandidateProposal(
             agent.agent_id, float(base), max(p_hat, 0.05), q_hat, relevance,
-            agent.token_cost, tuple(x), w_hat,
+            agent.token_cost, pair_tuple, w_hat,
         )
 
     def _submit(self, task: ReplayTask, now: float) -> None:
         controller = self._controller_for(task)
         if self.config.architecture in {"legacy_local_queue", "fixed_replay"}:
-            proposals = [self._proposal(controller, task, agent, now) for agent in self.agents]
+            shared: dict = {}
+            proposals = [self._proposal(controller, task, agent, now, shared) for agent in self.agents]
             if self.config.architecture == "fixed_replay":
                 # Exogenous balanced assignment: optimizer predictions cannot
                 # change the feedback stream used by the optimizer benchmark.
@@ -784,7 +1184,8 @@ class ControlledReplayExperiment:
             assigned_at = max(now, float(self.agent_available[chosen.agent_id]))
             self._schedule(task, controller, chosen, assigned_at, buffered=False)
             return
-        proposals = [self._proposal(controller, task, agent, now) for agent in self.agents]
+        shared: dict = {}
+        proposals = [self._proposal(controller, task, agent, now, shared) for agent in self.agents]
         self.buffer.submit(
             task_id=task.task_id, controller_id=controller.controller_id,
             arrival_time=task.arrival, deadline=task.deadline,
@@ -850,7 +1251,8 @@ class ControlledReplayExperiment:
         )
         self.task_records.append({
             "completion_index": self._completed, "task_id": task.source_id,
-            "domain": DOMAIN_ORDER[task.domain].value, "controller_id": event.controller_id,
+            "domain": task.domain_label, "domain_index": task.domain,
+            "controller_id": event.controller_id,
             "agent_id": event.agent_id, "arrival": task.arrival,
             "assigned_at": event.assigned_at, "finish": event.finish,
             "deadline": task.deadline, "wait_real": wait_real,
@@ -982,7 +1384,10 @@ class ControlledReplayExperiment:
         }
         worst_block_ratio = min(block_ratios.values()) if block_ratios else 0.0
         actual_capacity = pool_capacity(self.agents)
-        canonical_capacity = pool_capacity(make_agent_pool(CANONICAL_AGENTS))
+        # A measured table loads its own pool directly (table_oracle), so the
+        # synthetic canonical reference does not apply there.
+        canonical_capacity = (actual_capacity if hasattr(self.oracle, "potential")
+                              else pool_capacity(make_agent_pool(CANONICAL_AGENTS)))
         rho_effective = float(self.config.rho) * canonical_capacity / max(actual_capacity, 1e-12)
         return {
             "tasks": float(len(self.task_records)), "controllers": float(self.config.controllers),
@@ -1001,7 +1406,12 @@ class ControlledReplayExperiment:
             "mean_quality": float(values("quality_real").mean()),
             "deadline_hit_rate": float(values("deadline_hit").mean()),
             "mean_latency": float(values("latency").mean()),
+            "p50_latency": float(np.quantile(values("latency"), 0.50)),
             "p95_latency": float(np.quantile(values("latency"), 0.95)),
+            "p99_latency": float(np.quantile(values("latency"), 0.99)),
+            # SLO attainment is deadline_hit_rate; goodput counts only work that
+            # was both correct and on time, per unit of time.
+            "goodput": float(np.sum(values("success") * values("deadline_hit")) / max(makespan, 1e-12)),
             "mean_wait": float(values("wait_real").mean()),
             "p95_wait": float(np.quantile(values("wait_real"), 0.95)),
             "throughput": float(len(self.task_records) / max(makespan, 1e-12)),
@@ -1013,6 +1423,9 @@ class ControlledReplayExperiment:
             "oracle_queries": float(self.optimizer.state.query_count),
             "infrastructure_units": float(self.config.agents + 0.25 * self.config.controllers),
             **self._generalization_metrics(),
+            **(self._routing_references() if hasattr(self.oracle, "potential") else {}),
+            **({"own_quality_rmse": self._own_traffic_quality_rmse()}
+               if hasattr(self.oracle, "potential") else {}),
             **network_summary,
         }
 

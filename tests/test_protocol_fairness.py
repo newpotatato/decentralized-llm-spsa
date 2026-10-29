@@ -501,7 +501,7 @@ def test_queue_feature_is_not_identically_zero_under_fixed_replay():
     experiment._prediction_features = spy
     experiment.run()
     matrix = np.asarray(seen)
-    assert matrix.shape[1] == 9
+    assert matrix.shape[1] == experiment.controllers[0].feature_dim
     assert matrix[:, -1].max() > 0.0, "queue occupancy feature never became positive"
     assert np.linalg.matrix_rank(matrix) == matrix.shape[1]
 

@@ -1,0 +1,89 @@
+{
+  "code_revision": "ba8acaf87d247f3a9d54310e37315822a601046c-dirty",
+  "protocol": "Distributed tuning of the scheduler policy on measured LLM outcomes.\n\nThis is the protocol of ``policy_search_drift`` without drift -- the setting in\nwhich A-SPSA ranked first on the simulated benchmark (RAZVILKI R4.11, R5.11) --\ntransferred unchanged to replayed real outcomes (``table_oracle``).  Nothing in\nit is tuned for the transfer:\n\n* five sites, each owning its own domain group of the stream;\n* five buffer-priority weights per site, same defaults and bounds;\n* objective: deadline miss rate, 1 - DHR, on the site's own traffic;\n* ring consensus, omega = 0.3, step 0.2, perturbation 0.15, 30 rounds;\n* nine optimizer seeds, five held-out test seeds, paired Wilcoxon with Holm.\n\nStated before the run, as in R4.11: acceleration accumulates oracle noise, so\nA-SPSA should gain most from averaging the oracle over several streams, and the\nlow-noise condition is the one in which it can win.  Both conditions are run so\nthe prediction can fail.\n\nThe priority weights reach the outcome only through queueing and an argmax\nmatching, so there is no gradient and no closed form: zeroth-order search is\nthe applicable tool here, unlike for the linear predictors.\n",
+  "config": {
+    "benchmark": "llmrouterbench",
+    "sites": 5,
+    "rounds": 30,
+    "slots": 1,
+    "rho": 2.0,
+    "tasks_per_site": 60,
+    "embedding_dim": 8,
+    "omega": 0.3,
+    "test_seeds": [
+      11,
+      23,
+      37,
+      41,
+      53
+    ]
+  },
+  "oracle_seeds": {
+    "noisy": [
+      131
+    ],
+    "low_noise": [
+      131,
+      149,
+      163,
+      181
+    ]
+  },
+  "args": {
+    "benchmark": "llmrouterbench",
+    "output_dir": "real_benchmark_outputs\\policy_real_trace",
+    "sites": "5",
+    "rounds": "30",
+    "slots": "1",
+    "rho": "2.0",
+    "tasks_per_site": "60",
+    "embedding_dim": "8",
+    "omega": "0.3",
+    "methods": "['aspsa', 'spsa', 'zo_gt', 'zo_pgd']",
+    "optimizer_seeds": "[3, 11, 29, 47, 61, 83, 97, 113, 127]",
+    "noise_levels": "['noisy', 'low_noise']",
+    "workers": "5",
+    "tune_steps": "None",
+    "tune_seeds": "[3, 11]"
+  },
+  "selected_steps": {
+    "noisy/aspsa": 0.2,
+    "noisy/spsa": 0.2,
+    "noisy/zo_gt": 0.2,
+    "noisy/zo_pgd": 0.2,
+    "low_noise/aspsa": 0.2,
+    "low_noise/spsa": 0.2,
+    "low_noise/zo_gt": 0.2,
+    "low_noise/zo_pgd": 0.2
+  },
+  "weights": [
+    "hotness_weight",
+    "wait_pressure_weight",
+    "deadline_gap_penalty",
+    "budget_overrun_penalty",
+    "hotness_slope"
+  ],
+  "defaults": [
+    0.18,
+    0.12,
+    0.3,
+    0.08,
+    3.0
+  ],
+  "bounds": [
+    [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.25
+    ],
+    [
+      3.0,
+      3.0,
+      3.0,
+      3.0,
+      12.0
+    ]
+  ]
+}

@@ -1,0 +1,4 @@
+reference,variant,metric,pairs,reference_mean,variant_mean,mean_paired_difference,relative_difference_vs_variant,p_raw,effective_pairs,p_resolution_floor,p_at_resolution_floor,p_holm,reject_holm_0_05,practical_effect_ge_1pct
+aspsa,spsa,deadline_hit_rate,9,0.9102222222222223,0.886,0.024222222222222207,0.027338851266616487,0.00390625,9,0.00390625,True,0.01171875,True,True
+aspsa,zo_gt,deadline_hit_rate,9,0.9102222222222223,0.8922222222222221,0.018000000000000016,0.020174346201743482,0.00390625,9,0.00390625,True,0.01171875,True,True
+aspsa,zo_pgd,deadline_hit_rate,9,0.9102222222222223,0.8874074074074074,0.022814814814814857,0.025709515859766323,0.00390625,9,0.00390625,True,0.01171875,True,True

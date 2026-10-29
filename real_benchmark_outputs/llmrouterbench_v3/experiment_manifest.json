@@ -1,0 +1,212 @@
+{
+  "code_revision": "ba8acaf87d247f3a9d54310e37315822a601046c-dirty",
+  "benchmark": {
+    "repo": "NPULH/LLMRouterBench",
+    "revision": "0e5af1b",
+    "files": [
+      "bench-release.tar.gz"
+    ],
+    "datasets": {
+      "mmlupro/test_3000": "knowledge",
+      "gpqa/test": "knowledge",
+      "aime/hybrid": "math",
+      "livemathbench/test": "math",
+      "livecodebench/test": "code",
+      "swe-bench/verified": "software_engineering",
+      "simpleqa/test": "factual_qa",
+      "hle/test": "factual_qa",
+      "tau2/test": "agentic_reasoning",
+      "arc-agi/v1": "agentic_reasoning"
+    },
+    "models": [
+      "claude-sonnet-4",
+      "deepseek-r1-0528",
+      "deepseek-v3-0324",
+      "deepseek-v3.1-terminus",
+      "gemini-2.5-flash",
+      "gemini-2.5-pro",
+      "glm-4.6",
+      "gpt-5",
+      "intern-s1",
+      "kimi-k2-0905",
+      "qwen3-235b-a22b-2507"
+    ]
+  },
+  "provenance": {
+    "quality": "measured: benchmark score (execution tests for code/SWE-bench, exact match, task success for tau2) (LLMRouterBench)",
+    "success": "derived: quality >= 0.5",
+    "input_tokens": "measured (LLMRouterBench)",
+    "output_tokens": "measured, including reasoning tokens (LLMRouterBench)",
+    "cost_usd": "measured: API cost recorded by LLMRouterBench",
+    "latency": "modelled: TTFT + output_tokens / decode rate (src.table_oracle)",
+    "reference_router": "measured: OpenRouter auto-router on the same prompts (LLMRouterBench)"
+  },
+  "latency_profiles_source": "assumed order-of-magnitude hosted-inference profiles; not measured",
+  "latency_profiles": {
+    "claude-sonnet-4": [
+      1.2,
+      60.0
+    ],
+    "deepseek-r1-0528": [
+      1.5,
+      35.0
+    ],
+    "deepseek-v3-0324": [
+      1.0,
+      35.0
+    ],
+    "deepseek-v3.1-terminus": [
+      1.0,
+      40.0
+    ],
+    "gemini-2.5-flash": [
+      0.5,
+      200.0
+    ],
+    "gemini-2.5-pro": [
+      1.5,
+      110.0
+    ],
+    "glm-4.6": [
+      0.8,
+      50.0
+    ],
+    "gpt-5": [
+      1.5,
+      70.0
+    ],
+    "intern-s1": [
+      0.8,
+      50.0
+    ],
+    "kimi-k2-0905": [
+      0.8,
+      45.0
+    ],
+    "qwen3-235b-a22b-2507": [
+      0.7,
+      60.0
+    ]
+  },
+  "prefill_tokens_per_second": 4000.0,
+  "encoder": "sentence-transformers/all-MiniLM-L6-v2",
+  "regimes": {
+    "api": {
+      "slots_per_model": 32,
+      "rho": 0.5,
+      "latency_weight": 0.0,
+      "load_reference": "slowest_model"
+    },
+    "capacity": {
+      "slots_per_model": 4,
+      "rho": 0.85,
+      "latency_weight": -0.16,
+      "load_reference": "pool"
+    },
+    "stress": {
+      "slots_per_model": 1,
+      "rho": 0.85,
+      "latency_weight": -0.16,
+      "load_reference": "pool"
+    }
+  },
+  "price_weights": [
+    0.0,
+    -0.08,
+    -0.3,
+    -1.0,
+    -3.0
+  ],
+  "step_grid": [
+    1e-06,
+    1e-05,
+    0.0001,
+    0.001,
+    0.01,
+    0.05
+  ],
+  "step_selection": "min mean validation true_quality_rmse, shared criterion for every method",
+  "profile_prior": "processing and quality predictors start from the train-split per-domain profile",
+  "selected_steps": {
+    "api": {
+      "spsa": 0.0001,
+      "aspsa": 1e-05,
+      "zo_gt": 0.0001
+    },
+    "capacity": {
+      "spsa": 1e-05,
+      "aspsa": 0.001,
+      "zo_gt": 0.0001
+    },
+    "stress": {
+      "spsa": 0.05,
+      "aspsa": 1e-06,
+      "zo_gt": 0.001
+    }
+  },
+  "prior_strengths": [
+    1.0,
+    10.0,
+    100.0
+  ],
+  "selected_rls_prior_strength": {
+    "api": 100.0,
+    "capacity": 100.0,
+    "stress": 10.0
+  },
+  "args": {
+    "benchmark": "llmrouterbench",
+    "output_dir": "real_benchmark_outputs\\llmrouterbench_v3",
+    "seeds": 10,
+    "validation_seeds": 2,
+    "tasks": 1000,
+    "per_domain": null,
+    "controllers": 3,
+    "controller_assignment": "load",
+    "embedding_dim": 8,
+    "arrival": "azure_code",
+    "slo_scale": 3.0,
+    "time_unit_seconds": 30.0,
+    "max_processing_units": 100.0,
+    "max_waiting_units": 200.0,
+    "regimes": [
+      "api",
+      "capacity",
+      "stress"
+    ],
+    "systems": [
+      "random",
+      "cost_greedy",
+      "quality_greedy",
+      "static_domain",
+      "shortest_queue",
+      "knn_router",
+      "local_rls",
+      "spsa",
+      "aspsa",
+      "zo_gt",
+      "oracle"
+    ],
+    "workers": 5,
+    "pair_quality_feature": true,
+    "diffusion_mixing": 0.0,
+    "specialization": 0.5,
+    "aggregate_from": null
+  },
+  "test_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10
+  ],
+  "validation_seeds": [
+    1000,
+    1001
+  ]
+}

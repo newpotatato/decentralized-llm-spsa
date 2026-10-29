@@ -129,7 +129,7 @@ class DistributedZerothOrderOptimizer:
         active_blocks: tuple[str, ...] = ("processing", "waiting", "quality"),
     ):
         if method not in METHODS and method not in {
-            "aspsa_no_momentum", "aspsa_fixed_beta", "aspsa_no_consensus"
+            "aspsa_no_momentum", "aspsa_fixed_beta", "aspsa_no_consensus", "aspsa_convex"
         }:
             raise ValueError(f"unknown optimizer: {method}")
         valid_blocks = {"processing", "waiting", "quality"}
@@ -317,7 +317,17 @@ class DistributedZerothOrderOptimizer:
         for controller, vector in zip(controllers, vectors):
             center = self._surrogate_center(controller, vector)
             centers.append(center)
-            probes.append((alpha * previous_gamma * center + gamma * vector) / denominator)
+            if self.method == "aspsa_convex":
+                # With gamma_tau built from alpha_{tau-1} (manuscript indexing)
+                # the weights alpha*gamma_{tau-1} + gamma_tau need not sum to
+                # the denominator, so the probe is not a convex combination:
+                # at the first round it is about (1 + alpha) * theta.  This
+                # variant normalises the weights, the textbook estimate-
+                # sequence form, and is otherwise identical.
+                weights = alpha * previous_gamma + gamma
+                probes.append((alpha * previous_gamma * center + gamma * vector) / weights)
+            else:
+                probes.append((alpha * previous_gamma * center + gamma * vector) / denominator)
         probe_averages = self._ring_average(probes)
 
         out = []

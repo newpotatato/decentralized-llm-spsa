@@ -122,6 +122,26 @@ class BufferPolicy:
     # in the same proportion.  Shape (domains, 5), columns in the order
     # hotness, wait pressure, deadline gap, budget overrun, hotness slope.
     per_domain: Optional[np.ndarray] = None
+    # Which tasks are served first.  "weighted" is the priority above.  The
+    # classic SLO-aware rules of the serving literature serve tasks strictly in
+    # the order of one urgency key and send each to its best free agent by
+    # base score: "edf" earliest deadline, "llf" least laxity (deadline minus
+    # now minus the fastest reachable predicted processing time), "sjf"
+    # shortest predicted processing time.  The weights are then unused.
+    order: str = "weighted"
+    # Deadline urgency: -weight * (deadline - now) / scale is added to every
+    # edge of a task.  It is task-level, so it decides which tasks are served
+    # first and never which agent serves one.  A large weight makes the
+    # weighted priority earliest-deadline-first; with the budget-overrun
+    # penalty it can serve early deadlines first while passing over tasks that
+    # can no longer make theirs.  Zero, the default, leaves the priority as it was.
+    deadline_urgency_weight: float = 0.0
+    urgency_scale: float = 1.0
+
+    ORDERS = ("weighted", "edf", "llf", "sjf")
+    # Rank gap that makes a rule lexicographic: it exceeds any sum of base-score
+    # differences a matching over the agent pool could trade against one rank.
+    RANK_GAP = 1e4
 
     def weights_for(self, domain: Optional[int]) -> tuple[float, float, float, float, float]:
         """The five priority weights that apply to a task of this domain."""
@@ -135,6 +155,8 @@ class BufferPolicy:
     def __post_init__(self) -> None:
         if self.matching not in {"exact", "greedy"}:
             raise ValueError("matching must be exact or greedy")
+        if self.order not in self.ORDERS:
+            raise ValueError(f"order must be one of {self.ORDERS}")
 
 
 class GlobalAssignmentBuffer:
@@ -212,6 +234,7 @@ class GlobalAssignmentBuffer:
         """
 
         eps = self.policy.epsilon
+        rule_rows: List[tuple[BufferedTask, List[CandidateState], List[CandidateState]]] = []
         for task in self.pending_tasks():
             dynamic_rows: List[CandidateState] = []
             reachable: List[CandidateState] = []
@@ -274,6 +297,39 @@ class GlobalAssignmentBuffer:
                     - w_gap * candidate.deadline_gap
                     - w_over * max(0.0, candidate.required_time_ratio - 1.0)
                 )
+            if self.policy.deadline_urgency_weight:
+                urgency = (self.policy.deadline_urgency_weight * (task.deadline - float(now))
+                           / self.policy.urgency_scale)
+                for candidate in dynamic_rows:
+                    candidate.priority -= urgency
+            if self.policy.order != "weighted":
+                rule_rows.append((task, dynamic_rows, slack_source))
+
+        if rule_rows:
+            self._rank_by_rule(now, rule_rows)
+
+    def _rank_by_rule(
+        self,
+        now: float,
+        rule_rows: List[tuple[BufferedTask, List[CandidateState], List[CandidateState]]],
+    ) -> None:
+        """Priorities of a classic rule: urgency rank first, base score second."""
+        order = self.policy.order
+
+        def urgency(entry) -> tuple[float, int]:
+            task, _, source = entry
+            fastest = min(row.proposal.predicted_processing for row in source)
+            if order == "edf":
+                key = task.deadline
+            elif order == "llf":
+                key = task.deadline - float(now) - fastest
+            else:
+                key = fastest
+            return (key, task.task_id)
+
+        for rank, (_, rows, _) in enumerate(sorted(rule_rows, key=urgency)):
+            for candidate in rows:
+                candidate.priority = candidate.proposal.base_score - self.policy.RANK_GAP * rank
 
     def dispatch(
         self,

@@ -1,0 +1,83 @@
+{
+  "code_revision": "ba8acaf87d247f3a9d54310e37315822a601046c-dirty",
+  "protocol": "The manuscript's three functionals on the scheduler policy, measured outcomes.\n\nThe protocol of the simulated ``policy_three_blocks`` (RAZVILKI R5.10),\ntransferred unchanged to replayed real outcomes (``table_oracle``).  The\nscheduler weights form three blocks, each owning one of the manuscript's three\nfunctionals:\n\n  block p   (deadline gap, budget overrun, latency weight)   mean service time\n  block w   (hotness, wait pressure, hotness slope)           p95 waiting time\n  block q   (quality, relevance and price weights)            1 - mean quality\n\nEvery block is its own zeroth-order problem with its own two-point estimate per\nround, the blocks are synchronised across five sites exactly as the prediction\nblocks of the manuscript are, and every site owns its own copy.  Service time\nis latency minus waiting, so blocks p and w act on different quantities.\n\n    python -m src.policy_real_three --output-dir real_benchmark_outputs/policy_real_three\n",
+  "config": {
+    "benchmark": "llmrouterbench",
+    "sites": 5,
+    "rounds": 25,
+    "slots": 1,
+    "rho": 2.0,
+    "tasks_per_site": 60,
+    "embedding_dim": 8,
+    "omega": 0.3,
+    "test_seeds": [
+      11,
+      23,
+      37,
+      41,
+      53
+    ]
+  },
+  "oracle_seeds": [
+    131,
+    149,
+    163,
+    181
+  ],
+  "defaults": [
+    0.3,
+    0.08,
+    -0.16,
+    0.18,
+    0.12,
+    3.0,
+    1.1,
+    0.4,
+    -0.08
+  ],
+  "bounds": [
+    [
+      0.0,
+      0.0,
+      -2.0,
+      0.0,
+      0.0,
+      0.25,
+      0.0,
+      0.0,
+      -2.0
+    ],
+    [
+      3.0,
+      3.0,
+      0.0,
+      3.0,
+      3.0,
+      12.0,
+      4.0,
+      3.0,
+      0.0
+    ]
+  ],
+  "blocks": {
+    "processing": [
+      0,
+      3
+    ],
+    "waiting": [
+      3,
+      6
+    ],
+    "quality": [
+      6,
+      9
+    ]
+  },
+  "optimizer": {
+    "step_size": 0.2,
+    "perturbation": 0.15,
+    "omega": 0.3,
+    "gamma0": 1.0,
+    "mu_minus_eta": 0.001
+  }
+}

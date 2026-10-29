@@ -1,0 +1,6 @@
+method,mean_final_on_time,runs
+aspsa,270.24444444444447,45
+spsa,259.0,45
+zo_gt,258.6666666666667,45
+zo_pgd,259.1111111111111,45
+hand-set defaults,258.4,5
