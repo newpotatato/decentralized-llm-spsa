@@ -116,3 +116,8 @@ run_report_chain.sh
 
 # Internal notes (not for publication)
 REAL_BENCHMARK_INTERNAL_NOTES.md
+layer_outputs/
+CONVERSATION_HANDOFF.md
+ARCHITECTURE_REVIEW_NOTES.tex
+РАЗБОР_ПРОБЛЕМ.md
+РАЗВИЛКИ.md
